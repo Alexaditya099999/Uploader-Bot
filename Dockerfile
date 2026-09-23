@@ -2,6 +2,9 @@ FROM aiogram/telegram-bot-api:latest
 
 USER root
 
+# 🔥 ENTRYPOINT override — warna default entrypoint chalega
+ENTRYPOINT []
+
 RUN apk add --no-cache \
     python3 \
     py3-pip \
