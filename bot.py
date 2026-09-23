@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════
 #  ⚙️  CONFIG — SIRF YAHAN BADLO
 # ═══════════════════════════════════════════════
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"   # ← BotFather se
+BOT_TOKEN = "8933523621:AAHzHsW765IJ5Fl1rPSpdYsOI-Oc0m-03GE"   # ← BotFather se
 
 # 🔹 Fixed API (pehle message wala)
 API_ENDPOINT = "https://appx-sign-urls-g-483856624945.herokuapp.com/fetch_video"
