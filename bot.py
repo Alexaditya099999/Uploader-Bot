@@ -83,6 +83,8 @@ MAX_UPLOAD_MB   = 4000 if LOCAL_API_OK else 50
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+THUMB_DIR    = Path("thumbs")
+THUMB_DIR.mkdir(exist_ok=True)
 DATA_FILE    = Path("users.json")
 
 WAITING_TXT  = set()
@@ -180,13 +182,11 @@ def build_candidate_urls(video_id, course_id, token, userid):
         f"https://{AKAMAI_HOST}/video/{cid}/{vid}.mp4",
         f"https://{AKAMAI_HOST}/media/{cid}/{vid}.mp4",
         f"https://{AKAMAI_HOST}/hls/{cid}/{vid}.m3u8",
-        f"https://{AKAMAI_HOST}/hls/{cid}/{vid}/master.m3u8",
-        f"https://{AKAMAI_HOST}/{vid}.mp4",
-        f"https://{AKAMAI_HOST}/videos/{vid}.mp4",
     ]
 
 
-def is_url_live(url, timeout=8):
+def is_url_live(url, timeout=3):
+    """🔥 timeout 3s (pehle 8s tha) — stop jaldi kaam karega."""
     try:
         r = requests.head(url, timeout=timeout, allow_redirects=True,
                           headers={"User-Agent": "Mozilla/5.0"})
@@ -195,14 +195,16 @@ def is_url_live(url, timeout=8):
         return False
 
 
-def find_working_url(video_id, course_id, token, userid):
+def find_working_url(video_id, course_id, token, userid, user_id=None):
     for url in build_candidate_urls(video_id, course_id, token, userid):
+        if user_id and is_stopped(user_id):
+            raise yt_dlp.utils.DownloadError("User stopped")
         if is_url_live(url):
             return url
     raise ValueError("Koi URL pattern kaam nahi kiya")
 
 
-def resolve_url(url):
+def resolve_url(url, user_id=None):
     if is_direct_media_url(url):
         return url
     if is_api_url(url):
@@ -213,34 +215,66 @@ def resolve_url(url):
         userid    = qs.get("userid",    [FALLBACK_USERID])[0]
         course_id = qs.get("course_id", [COURSE_ID])[0]
         if video_id and token:
-            return find_working_url(video_id, course_id, token, userid)
+            return find_working_url(video_id, course_id, token, userid, user_id)
     return url
 
 # ═══════════════════════════════════════════════════════════
-#  🎨 FANCY PROGRESS FORMAT
+#  🖼️ THUMBNAIL GENERATOR
 # ═══════════════════════════════════════════════════════════
-def make_bar(pct: float, width: int = 20) -> str:
-    """▓▓▓░░░ style progress bar."""
-    filled = int(width * pct / 100)
-    filled = max(0, min(width, filled))
-    return "▓" * filled + "░" * (width - filled)
+def generate_thumbnail(video_path: Path, out_path: Path, seek_sec: int = 5) -> bool:
+    """Video se pehla frame nikalo — Telegram thumbnail ke liye."""
+    try:
+        # Pehle try: 5s pe seek karo
+        r = subprocess.run([
+            "ffmpeg", "-y",
+            "-ss", str(seek_sec),
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-vf", "scale=320:-1",
+            "-q:v", "5",
+            str(out_path)
+        ], capture_output=True, timeout=30)
+
+        if out_path.exists() and out_path.stat().st_size > 0:
+            return True
+
+        # Fallback: pehla hi frame le lo
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-vf", "scale=320:-1",
+            "-q:v", "5",
+            str(out_path)
+        ], capture_output=True, timeout=30)
+
+        return out_path.exists() and out_path.stat().st_size > 0
+    except Exception as e:
+        print(f"⚠️ Thumb fail: {e}")
+        return False
+
+# ───────── HELPERS ─────────
+def fmt_size(b):
+    b = float(b or 0)
+    if b < 1024: return f"{b:.0f} B"
+    if b < 1024**2: return f"{b/1024:.1f} KB"
+    if b < 1024**3: return f"{b/1024**2:.1f} MB"
+    return f"{b/1024**3:.2f} GB"
 
 
 def fmt_size_mib(b):
-    """MiB/GiB format — 1 MiB = 1024*1024 bytes."""
     b = float(b or 0)
     mib = b / (1024 * 1024)
     if mib < 1024:
         return f"{mib:.2f} MiB"
-    gib = mib / 1024
-    return f"{gib:.2f} GiB"
+    return f"{mib / 1024:.2f} GiB"
 
 
 def fmt_speed_mib(bps):
     return fmt_size_mib(bps) + "/s"
 
 
-def fmt_eta_fancy(secs: float) -> str:
+def fmt_eta_fancy(secs):
     if secs is None or secs < 0 or secs == float("inf"):
         return "Calculating..."
     secs = int(secs)
@@ -253,23 +287,20 @@ def fmt_eta_fancy(secs: float) -> str:
     return f"{h}h, {m}m"
 
 
-def build_fancy_progress(
-    phase: str,       # "Downloading" or "Uploading"
-    done: int,
-    total: int,
-    speed: float,
-    header: str = "",
-) -> str:
-    """Fancy box-style progress — Telegram friendly (no monospace needed)."""
+def make_bar(pct, width=20):
+    filled = int(width * pct / 100)
+    filled = max(0, min(width, filled))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def build_fancy_progress(phase, done, total, speed, header=""):
     pct = (done / total * 100) if total else 0.0
     bar = make_bar(pct, 20)
     eta = fmt_eta_fancy((total - done) / speed if speed and total > done else None)
-
     lines = []
     if header:
         lines.append(header)
         lines.append("")
-
     lines.append(f"┌─「 {phase} 」─○")
     lines.append("│")
     lines.append(f"│ » Progress:- {pct:.2f}%")
@@ -283,7 +314,6 @@ def build_fancy_progress(
     lines.append(f"│ » ETA:- {eta}")
     lines.append("│")
     lines.append("└────────────────────○")
-
     return "\n".join(lines)
 
 
@@ -362,8 +392,8 @@ def download_file(url, out_dir, base, info, user_id=None):
         "concurrent_fragment_downloads": 16,
         "http_chunk_size": 10485760,
         "buffersize": 1024 * 1024,
-        "retries": 10,
-        "fragment_retries": 10,
+        "retries": 5,
+        "fragment_retries": 5,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Referer": f"https://{AKAMAI_HOST}/",
@@ -376,7 +406,7 @@ def download_file(url, out_dir, base, info, user_id=None):
         raise FileNotFoundError("Downloaded file missing")
     return files[0]
 
-# ───────── UPLOAD PROGRESS WRAPPER ─────────
+# ───────── UPLOAD PROGRESS ─────────
 class ProgressFile:
     def __init__(self, path, info):
         self._f = open(path, "rb")
@@ -423,8 +453,7 @@ async def process_items(update, ctx, items):
 
     status = await ctx.bot.send_message(
         chat_id,
-        f"🎬 Sequential Mode ({mode})\n"
-        f"Total: {total} item(s)\n\n"
+        f"🎬 Sequential Mode ({mode})\nTotal: {total} item(s)\n\n"
         f"`/stop` ya niche button se rok sakte ho.",
         parse_mode="Markdown",
         reply_markup=cancel_kb,
@@ -446,17 +475,20 @@ async def process_items(update, ctx, items):
 
         # STEP 1: VERIFY
         await safe_edit(ctx.bot, chat_id, status.message_id,
-                        f"{header}\n\n🔐 Step 1/3 — Verifying...",
-                        cancel_kb)
+                        f"{header}\n\n🔐 Step 1/3 — Verifying...", cancel_kb)
+
+        if is_stopped(user_id):
+            stopped = True
+            break
+
         try:
-            final_url = await loop.run_in_executor(None, resolve_url, item["url"])
+            final_url = await loop.run_in_executor(
+                None, resolve_url, item["url"], user_id)
         except PermissionError as e:
             fail_verify.append((name, f"auth: {str(e)[:200]}"))
-            await asyncio.sleep(0.5)
             continue
         except Exception as e:
             fail_verify.append((name, f"url: {str(e)[:200]}"))
-            await asyncio.sleep(0.5)
             continue
 
         if is_stopped(user_id):
@@ -477,8 +509,7 @@ async def process_items(update, ctx, items):
             txt = build_fancy_progress(
                 "Downloading",
                 dl_info["done"], dl_info["total"], dl_info["speed"],
-                header=header
-            )
+                header=header)
             await safe_edit(ctx.bot, chat_id, status.message_id, txt, cancel_kb)
 
         if stopped:
@@ -505,22 +536,47 @@ async def process_items(update, ctx, items):
             stopped = True
             break
 
+        # 🖼️ THUMBNAIL generate (VIDEO ke liye)
+        thumb_path = None
+        if ftype != "PDF" and out_path.suffix.lower() != ".pdf":
+            t_path = THUMB_DIR / f"{base}.jpg"
+            ok_thumb = await loop.run_in_executor(
+                None, generate_thumbnail, out_path, t_path)
+            if ok_thumb:
+                thumb_path = t_path
+
         # STEP 3: UPLOAD
         up_info = {"done": 0, "total": os.path.getsize(out_path), "speed": 0}
         wrapper = ProgressFile(str(out_path), up_info)
-        caption = f"📁 {group}\n🎬 {name}\n🔖 {ftype}"[:1000]
+
+        # 🔥 Caption format (File_ID + Name dikhega)
+        file_id_num = idx
+        display_name = out_path.name
+        if ftype == "PDF":
+            display_name = f"{name[:60]}.pdf"
+        else:
+            display_name = f"{name[:60]}.mp4"
+
+        caption = (
+            f"[📁] File_ID : {file_id_num}\n"
+            f"NAME : {display_name}\n\n"
+            f"📁 {group}\n🎬 {name}\n🔖 {ftype}"
+        )[:1024]
 
         try:
-            ext = out_path.suffix.lower()
-            if ext == ".pdf" or ftype == "PDF":
+            if ftype == "PDF" or out_path.suffix.lower() == ".pdf":
                 coro = ctx.bot.send_document(
                     chat_id=chat_id, document=wrapper,
-                    filename=f"{name[:60]}{ext or '.pdf'}", caption=caption,
+                    filename=display_name,
+                    caption=caption,
+                    thumbnail=open(thumb_path, "rb") if thumb_path else None,
                     read_timeout=7200, write_timeout=7200)
             else:
                 coro = ctx.bot.send_video(
                     chat_id=chat_id, video=wrapper,
-                    filename=f"{name[:60]}{ext or '.mp4'}", caption=caption,
+                    filename=display_name,
+                    caption=caption,
+                    thumbnail=open(thumb_path, "rb") if thumb_path else None,
                     supports_streaming=True,
                     read_timeout=7200, write_timeout=7200)
         except Exception as e:
@@ -540,8 +596,7 @@ async def process_items(update, ctx, items):
             txt = build_fancy_progress(
                 "Uploading",
                 up_info["done"], up_info["total"], up_info["speed"],
-                header=header
-            )
+                header=header)
             await safe_edit(ctx.bot, chat_id, status.message_id, txt, cancel_kb)
 
         try:
@@ -556,6 +611,9 @@ async def process_items(update, ctx, items):
             wrapper.close()
             try: os.remove(out_path)
             except: pass
+            if thumb_path and thumb_path.exists():
+                try: thumb_path.unlink()
+                except: pass
 
         if stopped:
             break
@@ -576,6 +634,7 @@ async def process_items(update, ctx, items):
                 final += f"• {n[:30]} → {e[:80]}\n"
 
     await safe_edit(ctx.bot, chat_id, status.message_id, final)
+    STOP_FLAGS.pop(user_id, None)
 
 
 async def start_batch(update, ctx, items):
@@ -585,10 +644,9 @@ async def start_batch(update, ctx, items):
         ok_p, days = is_premium(user_id)
         if not ok_p:
             await update.message.reply_text(
-                "🚫 Access Denied\n\n"
-                "Aapke paas premium nahi hai.\n"
+                f"🚫 Access Denied\n\n"
                 f"Aapki ID: `{user_id}`\n"
-                "Owner se contact karo.",
+                f"Owner se contact karo.",
                 parse_mode="Markdown")
             return
 
@@ -614,13 +672,10 @@ async def add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if not ctx.args or len(ctx.args) < 2:
         await update.message.reply_text(
-            "Usage: `/add <user_id> <days>`\n"
-            "Example: `/add 123456789 30`",
-            parse_mode="Markdown")
+            "Usage: `/add <user_id> <days>`", parse_mode="Markdown")
         return
     try:
-        target = int(ctx.args[0])
-        days   = int(ctx.args[1])
+        target = int(ctx.args[0]); days = int(ctx.args[1])
     except ValueError:
         await update.message.reply_text("❌ Numbers hone chahiye.")
         return
@@ -639,8 +694,7 @@ async def add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             target,
             f"🎉 Premium Activated!\n\n"
             f"Duration: {days} din\n"
-            f"Expires: {exp_str}",
-            parse_mode="Markdown")
+            f"Expires: {exp_str}")
     except Exception:
         pass
 
@@ -659,7 +713,7 @@ async def remove_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ user_id number hona chahiye.")
         return
     if remove_premium(target):
-        await update.message.reply_text(f"✅ `{target}` ka premium remove.", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ `{target}` remove.", parse_mode="Markdown")
     else:
         await update.message.reply_text(f"ℹ️ `{target}` premium me nahi tha.", parse_mode="Markdown")
 
@@ -675,7 +729,7 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     now = datetime.now()
     lines = ["👥 Premium Users\n"]
-    active, expired = 0, 0
+    active = expired = 0
     for uid, u in users.items():
         try:
             exp = datetime.fromisoformat(u["expires"])
@@ -693,14 +747,13 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def myid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await update.message.reply_text(
-        f"🆔 Aapki Telegram ID: `{uid}`", parse_mode="Markdown")
+    await update.message.reply_text(f"🆔 Aapki ID: `{uid}`", parse_mode="Markdown")
 
 
 async def premium_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if is_owner(uid):
-        await update.message.reply_text("👑 Aap owner ho — unlimited.")
+        await update.message.reply_text("👑 Owner — unlimited.")
         return
     ok_p, days = is_premium(uid)
     if ok_p:
@@ -725,9 +778,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🔧 Mode: {mode}\n"
         f"📦 Max: {MAX_UPLOAD_MB} MB\n"
         f"🎫 Access: {access}\n\n"
-        f"📌 Kaise use karo:\n"
-        f"• Koi bhi URL bhejo → upload\n"
-        f"• /txt → TXT file batch\n\n"
+        f"📌 Use:\n"
+        f"• Koi bhi URL → upload\n"
+        f"• /txt → TXT batch\n\n"
         f"⚡ Commands:\n"
         f"• /start /help — Info\n"
         f"• /txt — TXT mode\n"
@@ -736,8 +789,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"• /myid — Apni ID")
 
 
-async def help_cmd(update, ctx):
-    await start(update, ctx)
+async def help_cmd(update, ctx): await start(update, ctx)
 
 
 async def stop_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -751,7 +803,6 @@ async def stop_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Inline button cancel."""
     q = update.callback_query
     await q.answer("Cancelling...")
     try:
@@ -806,8 +857,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("/"):
         return
     if not URL_RE.search(text):
-        await update.message.reply_text(
-            "❓ URL bhejo ya /txt se TXT upload karo.")
+        await update.message.reply_text("❓ URL bhejo ya /txt se TXT upload karo.")
         return
     items = parse_txt(text)
     if not items:
