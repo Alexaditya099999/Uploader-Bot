@@ -41,8 +41,7 @@ def auto_logout_public_api():
     try:
         r = requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/logOut", timeout=10)
-        data = r.json()
-        if data.get("ok"):
+        if r.json().get("ok"):
             print("✅ Public API logout")
     except Exception as e:
         print(f"⚠️ Logout fail: {e}")
@@ -94,11 +93,13 @@ CURRENT_TASK = {}
 MEDIA_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv",
               ".mp3", ".m4a", ".pdf", ".zip", ".rar", ".ts")
 
+# 🔥 Updated default caption — Download By added
 DEFAULT_CAPTION = (
     "[📁] File_ID : {file_index}\n\n"
     "NAME  : {file_name}\n\n"
     "💼  Size : {file_size}\n\n"
-    "📚 BATCH NAME : {batch_name}"
+    "📚 BATCH NAME : {batch_name}\n\n"
+    "DOWNLOADED BY : {downloaded_by} ❤️"
 )
 
 # ═══════════════════════════════════════════════════════════
@@ -264,7 +265,7 @@ def resolve_url(url, user_id=None):
     return url
 
 # ═══════════════════════════════════════════════════════════
-#  🖼️ THUMBNAIL + DURATION
+#  🖼️ THUMBNAIL + DURATION (FIXED)
 # ═══════════════════════════════════════════════════════════
 def generate_thumbnail(video_path: Path, out_path: Path, seek_sec: int = 5) -> bool:
     try:
@@ -286,15 +287,55 @@ def generate_thumbnail(video_path: Path, out_path: Path, seek_sec: int = 5) -> b
         return False
 
 
-def get_duration(path) -> float:
+def get_media_info(path) -> dict:
+    """
+    🔥 FIXED — Duration, width, height teeno nikalo.
+    Format se pehle, phir stream se fallback.
+    """
+    info = {"duration": 0.0, "width": 0, "height": 0}
     try:
+        # Duration from format
         r = subprocess.run([
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", str(path)
-        ], capture_output=True, timeout=15, text=True)
-        return float(r.stdout.strip())
-    except Exception:
-        return 0.0
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path)
+        ], capture_output=True, timeout=20, text=True)
+        try:
+            info["duration"] = float(r.stdout.strip())
+        except Exception:
+            pass
+
+        # Fallback: video stream duration
+        if info["duration"] <= 0:
+            r = subprocess.run([
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path)
+            ], capture_output=True, timeout=20, text=True)
+            try:
+                info["duration"] = float(r.stdout.strip())
+            except Exception:
+                pass
+
+        # Width / Height
+        r = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=s=x:p=0",
+            str(path)
+        ], capture_output=True, timeout=20, text=True)
+        out = r.stdout.strip()
+        if "x" in out:
+            parts = out.split("x")
+            info["width"] = int(parts[0])
+            info["height"] = int(parts[1])
+    except Exception as e:
+        print(f"⚠️ ffprobe fail: {e}")
+    return info
 
 # ───────── HELPERS ─────────
 def fmt_size(b):
@@ -328,7 +369,7 @@ def fmt_eta_fancy(secs):
 
 
 def fmt_duration(secs):
-    if not secs or secs <= 0: return "N/A"
+    if not secs or secs <= 0: return "0:00"
     secs = int(secs)
     h, rem = divmod(secs, 3600)
     m, s = divmod(rem, 60)
@@ -377,7 +418,9 @@ async def safe_edit(bot, chat_id, msg_id, text, keyboard=None):
 def is_stopped(user_id):
     return STOP_FLAGS.get(user_id, False)
 
-# ───────── TXT PARSER ─────────
+# ═══════════════════════════════════════════════════════════
+#  📄 TXT PARSER (🔥 SMART — line break safe)
+# ═══════════════════════════════════════════════════════════
 URL_RE   = re.compile(r"(https?://\S+)")
 TYPE_RE  = re.compile(r"\[(VIDEO|PDF)\]", re.I)
 SHORT_RE = re.compile(
@@ -385,37 +428,82 @@ SHORT_RE = re.compile(
     r"\s*(?:[\|,]\s*(?P<uid>\d+))?\s*$")
 
 
+def url_basename(url: str) -> str:
+    """URL se filename nikalo (query string hatao)."""
+    clean = url.split("?")[0].split("#")[0]
+    name = clean.rstrip("/").split("/")[-1]
+    return name or "file"
+
+
 def parse_txt(text):
-    items, group = [], None
+    """
+    🔥 FIXED Parser:
+      - Agar line me "Name URL" dono hai → name wahi use karo
+      - Agar line me sirf URL → pichli line ka text name banao
+      - Agar pichli line bhi nahi → URL basename use karo
+    """
+    items = []
+    pending_name = None
+
     for raw in text.splitlines():
         line = raw.strip()
-        if not line: continue
+        if not line:
+            continue
+
         um = URL_RE.search(line)
+
+        # ─── LINE WITH URL ───
         if um:
             url = um.group(1).rstrip(").,;\"'")
             before = line[:um.start()].strip().rstrip(":").strip()
             tm = TYPE_RE.search(before)
             ftype = tm.group(1).upper() if tm else "VIDEO"
-            name = TYPE_RE.sub("", before).strip()
-            if group and name.startswith(group):
-                name = name[len(group):].strip()
-            name = name.rstrip(":").strip() or f"Item {len(items)+1}"
-            items.append({"group": group or "", "type": ftype,
-                          "name": name, "url": url, "mode": "url"})
+            name_part = TYPE_RE.sub("", before).strip()
+
+            if name_part:
+                name = name_part
+            elif pending_name:
+                name = pending_name
+            else:
+                name = url_basename(url)
+
+            name = name.rstrip(":").strip() or url_basename(url)
+
+            items.append({
+                "group": "",
+                "type": ftype,
+                "name": name,
+                "url": url,
+                "mode": "url",
+            })
+            pending_name = None
             continue
+
+        # ─── SHORT FORMAT ───
         sm = SHORT_RE.match(line)
         if sm:
-            items.append({"group": group or "", "type": "VIDEO",
-                          "name": f"Video {sm.group('vid')}",
-                          "video_id": sm.group("vid"),
-                          "token": sm.group("tok"),
-                          "userid": sm.group("uid"), "mode": "short"})
+            items.append({
+                "group": "", "type": "VIDEO",
+                "name": f"Video {sm.group('vid')}",
+                "video_id": sm.group("vid"),
+                "token": sm.group("tok"),
+                "userid": sm.group("uid"), "mode": "short",
+            })
+            pending_name = None
             continue
-        group = line.strip().strip(":").strip()
+
+        # ─── NO URL — line ko "pending name" banao ───
+        # Agar already pending hai, use overwrite na karo (group header hoga)
+        if not pending_name:
+            pending_name = line.rstrip(":").strip()
+        else:
+            # Purana discard, naya use karo
+            pending_name = line.rstrip(":").strip()
+
     return items
 
 # ═══════════════════════════════════════════════════════════
-#  📥 DOWNLOAD — 🔥 FIXED (No chunk/parallel breaks)
+#  📥 DOWNLOAD
 # ═══════════════════════════════════════════════════════════
 def download_file(url, out_dir, base, info, user_id=None):
     def hook(d):
@@ -433,16 +521,12 @@ def download_file(url, out_dir, base, info, user_id=None):
             if user_id and is_stopped(user_id):
                 raise yt_dlp.utils.DownloadError("User stopped")
 
-    # 🔥 Simple, reliable options — no http_chunk_size, no concurrent_fragment
     opts = {
         "outtmpl": str(out_dir / f"{base}.%(ext)s"),
         "format": "best[ext=mp4]/best",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
+        "quiet": True, "no_warnings": True, "noplaylist": True,
         "progress_hooks": [hook],
-        "retries": 10,
-        "fragment_retries": 10,
+        "retries": 10, "fragment_retries": 10,
         "socket_timeout": 30,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -511,6 +595,12 @@ async def process_items(update, ctx, items, batch_label=""):
     loop = asyncio.get_event_loop()
     total = len(items)
     mode = "4GB" if USE_LOCAL_API else "50MB"
+
+    # User ka display name
+    u = update.effective_user
+    downloaded_by = u.first_name or u.username or str(user_id)
+    if u.last_name:
+        downloaded_by += f" {u.last_name}"
 
     STOP_FLAGS[user_id] = False
 
@@ -599,13 +689,20 @@ async def process_items(update, ctx, items, batch_label=""):
             except: pass
             stopped = True; break
 
-        # THUMBNAIL
+        # THUMBNAIL + MEDIA INFO (FIXED — duration ab milta hai)
         thumb_path = None
-        if out_path.suffix.lower() not in (".pdf", ".mp3", ".m4a", ".zip", ".rar"):
+        media_info = {"duration": 0.0, "width": 0, "height": 0}
+        is_video = out_path.suffix.lower() not in (".pdf", ".mp3", ".m4a", ".zip", ".rar")
+
+        if is_video:
             t_path = THUMB_DIR / f"{base}.jpg"
             ok_thumb = await loop.run_in_executor(
                 None, generate_thumbnail, out_path, t_path)
             if ok_thumb: thumb_path = t_path
+
+            media_info = await loop.run_in_executor(
+                None, get_media_info, out_path)
+            print(f"🎬 Media: {media_info}")
 
         # CAPTION
         cap = get_user_caption(user_id)
@@ -613,17 +710,15 @@ async def process_items(update, ctx, items, batch_label=""):
         display_name = f"{name[:60]}.{ext}" if ext else f"{name[:60]}.mp4"
 
         if cap["enabled"]:
-            duration = 0.0
-            if ext in ("mp4", "mkv", "webm", "mov", "m4v", "avi", "flv", "ts"):
-                duration = await loop.run_in_executor(None, get_duration, out_path)
             values = {
                 "file_name": name,
                 "file_size": fmt_size(os.path.getsize(out_path)),
                 "file_extension": ext or "file",
-                "file_duration": fmt_duration(duration),
+                "file_duration": fmt_duration(media_info["duration"]),
                 "file_url": item["url"],
                 "file_index": idx,
                 "batch_name": batch_label or "Direct",
+                "downloaded_by": downloaded_by,
             }
             caption = render_caption(cap["template"], values)[:1024]
         else:
@@ -642,10 +737,14 @@ async def process_items(update, ctx, items, batch_label=""):
                     thumbnail=thumb_fh,
                     read_timeout=7200, write_timeout=7200)
             else:
+                # 🔥 FIXED — duration, width, height explicitly bhejo
                 coro = ctx.bot.send_video(
                     chat_id=chat_id, video=wrapper,
                     filename=display_name, caption=caption,
                     thumbnail=thumb_fh,
+                    duration=int(media_info["duration"]) if media_info["duration"] else 0,
+                    width=media_info["width"] or None,
+                    height=media_info["height"] or None,
                     supports_streaming=True,
                     read_timeout=7200, write_timeout=7200)
         except Exception as e:
@@ -745,7 +844,8 @@ def build_caption_menu(uid) -> str:
         "⏱ Duration : {file_duration}\n"
         "🔗 Link : {file_url}\n"
         "🔢 Index : {file_index}\n"
-        "📚 Batch Name : {batch_name}\n\n"
+        "📚 Batch Name : {batch_name}\n"
+        "👤 Downloaded By : {downloaded_by}\n\n"
         "═══════════════════════\n\n"
         "➤ Current:\n"
         f"{cap['template']}\n\n"
@@ -800,7 +900,8 @@ async def caption_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "✏️ *Caption Template Update*\n\n"
             "Naya template bhejo (text message).\n\n"
             "Variables: `{file_name}` `{file_size}` `{file_extension}` "
-            "`{file_duration}` `{file_url}` `{file_index}` `{batch_name}`\n\n"
+            "`{file_duration}` `{file_url}` `{file_index}` `{batch_name}` "
+            "`{downloaded_by}`\n\n"
             "Example:\n"
             "```\n🎬 {file_name}\n📦 {file_size}\n🔢 #{file_index}\n```\n\n"
             "/cancel bhejo to rok do.",
