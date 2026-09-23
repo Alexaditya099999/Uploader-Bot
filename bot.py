@@ -1,26 +1,24 @@
 # ═══════════════════════════════════════════════════════════
-#  ⚙️  CONFIG — SIRF YAHAN BADLO
+#  ⚙️  CONFIG  ✅ FIXED
 # ═══════════════════════════════════════════════════════════
-BOT_TOKEN = "8933523621:AAHzHsW765IJ5Fl1rPSpdYsOI-Oc0m-03GE"
+BOT_TOKEN = "8933523621:AAE6IS2nIS5OaflvAEVyQK4mEXzj0V-boK4"   # ⚠️ Purana revoke karo, naya daalo
 API_ID    = "20346550"
 API_HASH  = "bc79c3bea7a626887bdc0871eecf0327"
+OWNER_ID  = 8460497291
 
-COURSE_ID        = "41"
-FALLBACK_USERID  = "464995"
-AKAMAI_HOST      = "armathsapi.akamai.net.in"
-
-JWT_SECRET       = ""   # optional
-AKAMAI_SIGN_KEY  = ""   # optional
+COURSE_ID       = "41"
+FALLBACK_USERID = "464995"
+AKAMAI_HOST     = "armathsapi.akamai.net.in"
 # ═══════════════════════════════════════════════════════════
 
 import os
 import re
+import json
 import time
-import hmac
-import hashlib
 import asyncio
 import subprocess
 from pathlib import Path
+from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
 import requests
 import jwt
@@ -30,7 +28,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes
 )
 
-# ───────── LOCAL BOT API SERVER (2GB) ─────────
+# ───────── LOCAL BOT API SERVER ─────────
 LOCAL_API_PORT = 8081
 LOCAL_API_DIR  = "/tmp/tg-bot-api"
 os.makedirs(LOCAL_API_DIR, exist_ok=True)
@@ -55,74 +53,141 @@ def start_local_api_server():
                 pass
         except Exception as e:
             print(f"⚠️ {binary} fail: {e}")
-    print("⚠️ Local API nahi chala — 50MB mode")
     return False
 
-LOCAL_API_OK    = start_local_api_server()
-USE_LOCAL_API   = LOCAL_API_OK
+LOCAL_API_OK = start_local_api_server()
+USE_LOCAL_API = LOCAL_API_OK
 LOCAL_API_BASE  = f"http://localhost:{LOCAL_API_PORT}/bot" if LOCAL_API_OK else "https://api.telegram.org/bot"
 LOCAL_FILE_BASE = f"http://localhost:{LOCAL_API_PORT}/file/bot" if LOCAL_API_OK else "https://api.telegram.org/file/bot"
 MAX_UPLOAD_MB   = 2000 if LOCAL_API_OK else 50
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-WAITING_TXT = set()
+DATA_FILE    = Path("users.json")
+
+WAITING_TXT  = set()
+STOP_FLAGS   = {}
+CURRENT_TASK = {}
 
 # ═══════════════════════════════════════════════════════════
-#  🔥 BUILT-IN API
+#  💾 PREMIUM STORAGE
 # ═══════════════════════════════════════════════════════════
-def verify_jwt_token(token: str, userid: str) -> dict:
-    if not JWT_SECRET:
+def load_users() -> dict:
+    if not DATA_FILE.exists():
+        return {}
+    try:
+        return json.loads(DATA_FILE.read_text())
+    except Exception:
+        return {}
+
+def save_users(data: dict):
+    try:
+        DATA_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception as e:
+        print(f"⚠️ Save fail: {e}")
+
+def is_premium(user_id) -> tuple:
+    users = load_users()
+    u = users.get(str(user_id))
+    if not u:
+        return False, 0
+    try:
+        exp = datetime.fromisoformat(u["expires"])
+    except Exception:
+        return False, 0
+    now = datetime.now()
+    if exp < now:
+        return False, 0
+    days = (exp - now).days
+    return True, days
+
+def add_premium(user_id, days: int, added_by: int) -> str:
+    users = load_users()
+    now = datetime.now()
+    current = users.get(str(user_id))
+    if current:
         try:
-            payload = jwt.decode(token, options={"verify_signature": False})
-        except Exception as e:
-            raise PermissionError(f"Token decode fail: {str(e)[:100]}")
+            base = datetime.fromisoformat(current["expires"])
+            if base < now:
+                base = now
+        except Exception:
+            base = now
     else:
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        except jwt.ExpiredSignatureError:
-            raise PermissionError("Token expire ho gaya")
-        except jwt.InvalidTokenError as e:
-            raise PermissionError(f"Token invalid: {str(e)[:100]}")
-    if userid and str(payload.get("id", "")) != str(userid):
-        raise PermissionError(f"Userid mismatch")
-    return payload
+        base = now
+    new_exp = base + timedelta(days=days)
+    users[str(user_id)] = {
+        "expires": new_exp.isoformat(),
+        "added_by": added_by,
+        "added_at": now.isoformat(),
+    }
+    save_users(users)
+    return new_exp.strftime("%d %b %Y, %I:%M %p")
 
+def remove_premium(user_id) -> bool:
+    users = load_users()
+    if str(user_id) in users:
+        del users[str(user_id)]
+        save_users(users)
+        return True
+    return False
 
-def generate_signed_url(video_id: str, userid: str) -> str:
-    path = f"/videos/{COURSE_ID}/{video_id}.mp4"
-    if not AKAMAI_SIGN_KEY:
-        return f"https://{AKAMAI_HOST}{path}"
-    expires = int(time.time()) + 3600
-    acl = f"/*/videos/{COURSE_ID}/{video_id}*"
-    data = f"exp={expires}~acl={acl}~hmac="
-    hash_val = hmac.new(AKAMAI_SIGN_KEY.encode(), data.encode(),
-                        hashlib.sha256).hexdigest()
-    token = f"exp={expires}~acl={acl}~hmac={hash_val}"
-    return f"https://{AKAMAI_HOST}{path}?hdnts={token}"
+def is_owner(user_id) -> bool:
+    return int(user_id) == int(OWNER_ID)
 
+# ═══════════════════════════════════════════════════════════
+#  🎯 URL HANDLING
+# ═══════════════════════════════════════════════════════════
+def is_direct_media_url(url):
+    low = url.lower()
+    return any(low.endswith(e) for e in
+               (".mp4", ".mkv", ".webm", ".mov", ".m3u8", ".pdf", ".ts"))
 
-def builtin_api_fetch(course_id, video_id, token, userid):
-    verify_jwt_token(token, userid)
-    return generate_signed_url(video_id, userid)
+def is_api_url(url):
+    low = url.lower()
+    return "fetch_video" in low or ("video_id=" in low and "token=" in low)
 
+def build_candidate_urls(video_id, course_id, token, userid):
+    vid, cid = str(video_id), str(course_id)
+    return [
+        f"https://{AKAMAI_HOST}/{cid}/{vid}.mp4",
+        f"https://{AKAMAI_HOST}/videos/{cid}/{vid}.mp4",
+        f"https://{AKAMAI_HOST}/video/{cid}/{vid}.mp4",
+        f"https://{AKAMAI_HOST}/media/{cid}/{vid}.mp4",
+        f"https://{AKAMAI_HOST}/hls/{cid}/{vid}.m3u8",
+        f"https://{AKAMAI_HOST}/hls/{cid}/{vid}/master.m3u8",
+        f"https://{AKAMAI_HOST}/{vid}.mp4",
+        f"https://{AKAMAI_HOST}/videos/{vid}.mp4",
+        f"https://vod.{AKAMAI_HOST}/{cid}/{vid}.mp4",
+        f"https://cdn.{AKAMAI_HOST}/{cid}/{vid}.mp4",
+        f"https://stream.{AKAMAI_HOST}/{cid}/{vid}.mp4",
+    ]
 
-def resolve_item_to_url(item: dict) -> str:
-    if item["mode"] == "url":
-        p = urlparse(item["url"])
-        qs = parse_qs(p.query)
+def is_url_live(url, timeout=8):
+    try:
+        r = requests.head(url, timeout=timeout, allow_redirects=True,
+                          headers={"User-Agent": "Mozilla/5.0"})
+        return r.status_code in (200, 206)
+    except Exception:
+        return False
+
+def find_working_url(video_id, course_id, token, userid):
+    for url in build_candidate_urls(video_id, course_id, token, userid):
+        if is_url_live(url):
+            return url
+    raise ValueError("Koi URL pattern kaam nahi kiya")
+
+def resolve_url(url):
+    if is_direct_media_url(url):
+        return url
+    if is_api_url(url):
+        p = urlparse(url); qs = parse_qs(p.query)
         video_id  = qs.get("video_id",  [""])[0]
         token     = qs.get("token",     [""])[0]
         userid    = qs.get("userid",    [FALLBACK_USERID])[0]
         course_id = qs.get("course_id", [COURSE_ID])[0]
-        if not (video_id and token):
-            raise ValueError("URL me video_id/token missing")
-        return builtin_api_fetch(course_id, video_id, token, userid)
-    return builtin_api_fetch(
-        COURSE_ID, item["video_id"], item["token"],
-        item.get("userid") or FALLBACK_USERID)
-
-# ═══════════════════════════════════════════════════════════
+        if video_id and token:
+            return find_working_url(video_id, course_id, token, userid)
+    return url
 
 # ───────── HELPERS ─────────
 def fmt_size(b):
@@ -146,6 +211,8 @@ async def safe_edit(bot, chat_id, msg_id, text):
                                     text=text[:4000])
     except Exception:
         pass
+
+def is_stopped(user_id): return STOP_FLAGS.get(user_id, False)
 
 # ───────── TXT PARSER ─────────
 URL_RE   = re.compile(r"(https?://\S+)")
@@ -184,7 +251,7 @@ def parse_txt(text):
     return items
 
 # ───────── DOWNLOAD ─────────
-def download_file(url, out_dir, base, info):
+def download_file(url, out_dir, base, info, user_id=None):
     def hook(d):
         if d.get("status") == "downloading":
             info["done"]  = d.get("downloaded_bytes", 0)
@@ -197,6 +264,9 @@ def download_file(url, out_dir, base, info):
                     info["_t"], info["_b"] = t, info["done"]
             else:
                 info["_t"], info["_b"] = t, info["done"]
+            if user_id and is_stopped(user_id):
+                raise yt_dlp.utils.DownloadError("User stopped")
+
     opts = {
         "outtmpl": str(out_dir / f"{base}.%(ext)s"),
         "format": "best[ext=mp4]/best",
@@ -213,7 +283,7 @@ def download_file(url, out_dir, base, info):
     if not files: raise FileNotFoundError("Downloaded file missing")
     return files[0]
 
-# ───────── UPLOAD PROGRESS WRAPPER ─────────
+# ───────── UPLOAD PROGRESS ─────────
 class ProgressFile:
     def __init__(self, path, info):
         self._f = open(path, "rb")
@@ -239,195 +309,362 @@ class ProgressFile:
     def __enter__(self): return self
     def __exit__(self, *a): self.close()
 
-# ═══════════════════════════════════════════════════════════
-#  🎯 MAIN PROCESSOR — SEQUENTIAL (Verify → Download → Upload)
-# ═══════════════════════════════════════════════════════════
+# ───────── MAIN PROCESSOR ─────────
 async def process_items(update, ctx, items):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     loop = asyncio.get_event_loop()
-
     total = len(items)
-    mode = "🚀 2GB (Local API)" if USE_LOCAL_API else "⚠️ 50MB (Public API)"
+    mode = "🚀 2GB" if USE_LOCAL_API else "⚠️ 50MB"
+
+    STOP_FLAGS[user_id] = False
 
     status = await ctx.bot.send_message(
         chat_id,
-        f"🎬 *START — Sequential Mode*\n"
-        f"Mode: {mode}\n"
-        f"Total items: {total}\n\n"
-        f"Har item pehle verify hoga, phir download, phir upload.",
+        f"🎬 *Sequential Mode* ({mode})\nTotal: {total}\n\n"
+        f"`/stop` bhejo rokne ke liye.",
         parse_mode="Markdown"
     )
 
     ok, fail_verify, fail_dl, fail_up = 0, [], [], []
+    stopped = False
 
     for idx, item in enumerate(items, 1):
+        if is_stopped(user_id):
+            stopped = True; break
+
         name = item["name"][:100]
         ftype = item["type"]
         group = item["group"][:80]
-
         header = (f"📦 *Item {idx}/{total}*\n"
-                  f"📁 {group}\n"
-                  f"🎬 {name}\n"
-                  f"🔖 Type: {ftype}")
+                  f"📁 {group}\n🎬 {name}\n🔖 {ftype}")
 
-        # ─── STEP 1: VERIFY ───
         await safe_edit(ctx.bot, chat_id, status.message_id,
                         f"{header}\n\n🔐 *Step 1/3 — Verify...*")
         try:
-            signed = await loop.run_in_executor(None, resolve_item_to_url, item)
-            if not signed or not str(signed).startswith("http"):
-                raise ValueError("Invalid signed URL")
+            final_url = await loop.run_in_executor(None, resolve_url, item["url"])
         except PermissionError as e:
             fail_verify.append((name, f"auth: {str(e)[:200]}"))
-            await safe_edit(ctx.bot, chat_id, status.message_id,
-                f"{header}\n\n❌ *Verify FAIL*\n`{str(e)[:250]}`\n\n"
-                f"➡️ Agla item...")
-            await asyncio.sleep(1.5)
-            continue
+            await asyncio.sleep(0.5); continue
         except Exception as e:
-            fail_verify.append((name, f"api: {str(e)[:200]}"))
-            await safe_edit(ctx.bot, chat_id, status.message_id,
-                f"{header}\n\n❌ *Verify FAIL*\n`{str(e)[:250]}`\n\n"
-                f"➡️ Agla item...")
-            await asyncio.sleep(1.5)
-            continue
+            fail_verify.append((name, f"url: {str(e)[:200]}"))
+            await asyncio.sleep(0.5); continue
 
-        # ─── STEP 2: DOWNLOAD ───
+        if is_stopped(user_id):
+            stopped = True; break
+
         base = f"{user_id}_{idx}"
         dl_info = {"done": 0, "total": 0, "speed": 0}
         dl_task = loop.run_in_executor(
-            None, download_file, signed, DOWNLOAD_DIR, base, dl_info
-        )
+            None, download_file, final_url, DOWNLOAD_DIR, base, dl_info, user_id)
+
         while not dl_task.done():
             await asyncio.wait({dl_task}, timeout=3)
+            if is_stopped(user_id):
+                stopped = True; break
             pct = (dl_info["done"]/dl_info["total"]*100) if dl_info["total"] else 0
             await safe_edit(ctx.bot, chat_id, status.message_id,
-                f"{header}\n\n✅ Verify done\n"
-                f"📥 *Step 2/3 — Downloading: {pct:.1f}%*\n"
+                f"{header}\n\n✅ URL ready\n"
+                f"📥 *Downloading: {pct:.1f}%*\n"
                 f"   {fmt_size(dl_info['done'])} / {fmt_size(dl_info['total'])}\n"
-                f"⚡ Speed: {fmt_speed(dl_info['speed'])}\n"
-                f"⏱ ETA: {fmt_eta(dl_info['done'], dl_info['total'], dl_info['speed'])}")
+                f"⚡ {fmt_speed(dl_info['speed'])} | ⏱ {fmt_eta(dl_info['done'], dl_info['total'], dl_info['speed'])}")
+
+        if stopped:
+            try: await dl_task
+            except: pass
+            break
+
         try:
             out_path = await dl_task
         except Exception as e:
-            fail_dl.append((name, f"download: {str(e)[:200]}"))
-            await safe_edit(ctx.bot, chat_id, status.message_id,
-                f"{header}\n\n❌ *Download FAIL*\n`{str(e)[:250]}`\n\n"
-                f"➡️ Agla item...")
-            await asyncio.sleep(1.5)
+            fail_dl.append((name, f"dl: {str(e)[:200]}"))
             continue
 
         size_mb = os.path.getsize(out_path) / (1024 * 1024)
         if size_mb > MAX_UPLOAD_MB:
-            fail_dl.append((name, f"size {size_mb:.0f}MB > {MAX_UPLOAD_MB}MB"))
+            fail_dl.append((name, f"size {size_mb:.0f}MB"))
             try: os.remove(out_path)
             except: pass
-            await safe_edit(ctx.bot, chat_id, status.message_id,
-                f"{header}\n\n❌ *Too big:* {size_mb:.0f}MB (limit {MAX_UPLOAD_MB}MB)\n\n"
-                f"➡️ Agla item...")
-            await asyncio.sleep(1.5)
             continue
 
-        # ─── STEP 3: UPLOAD ───
+        if is_stopped(user_id):
+            try: os.remove(out_path)
+            except: pass
+            stopped = True; break
+
         up_info = {"done": 0, "total": os.path.getsize(out_path), "speed": 0}
         wrapper = ProgressFile(str(out_path), up_info)
         caption = f"📁 {group}\n🎬 {name}\n🔖 {ftype}"[:1000]
 
         try:
-            if ftype == "PDF":
+            ext = out_path.suffix.lower()
+            if ext == ".pdf" or ftype == "PDF":
                 coro = ctx.bot.send_document(
                     chat_id=chat_id, document=wrapper,
-                    filename=f"{name[:60]}.pdf", caption=caption,
+                    filename=f"{name[:60]}{ext or '.pdf'}", caption=caption,
                     read_timeout=7200, write_timeout=7200)
             else:
                 coro = ctx.bot.send_video(
                     chat_id=chat_id, video=wrapper,
-                    filename=f"{name[:60]}.mp4", caption=caption,
+                    filename=f"{name[:60]}{ext or '.mp4'}", caption=caption,
                     supports_streaming=True,
                     read_timeout=7200, write_timeout=7200)
         except Exception as e:
             wrapper.close()
             try: os.remove(out_path)
             except: pass
-            fail_up.append((name, f"upload-setup: {str(e)[:200]}"))
-            await asyncio.sleep(1.5)
+            fail_up.append((name, str(e)[:200]))
             continue
 
         send_task = asyncio.create_task(coro)
         while not send_task.done():
             await asyncio.wait({send_task}, timeout=3)
+            if is_stopped(user_id):
+                send_task.cancel()
+                stopped = True; break
             pct = (up_info["done"]/up_info["total"]*100) if up_info["total"] else 0
             await safe_edit(ctx.bot, chat_id, status.message_id,
-                f"{header}\n\n✅ Verify done\n✅ Download done\n"
-                f"📤 *Step 3/3 — Uploading: {pct:.1f}%*\n"
+                f"{header}\n\n✅ URL ready\n✅ Download done\n"
+                f"📤 *Uploading: {pct:.1f}%*\n"
                 f"   {fmt_size(up_info['done'])} / {fmt_size(up_info['total'])}\n"
-                f"⚡ Speed: {fmt_speed(up_info['speed'])}\n"
-                f"⏱ ETA: {fmt_eta(up_info['done'], up_info['total'], up_info['speed'])}")
+                f"⚡ {fmt_speed(up_info['speed'])} | ⏱ {fmt_eta(up_info['done'], up_info['total'], up_info['speed'])}")
 
         try:
-            await send_task
-            ok += 1
-            # Small success flash
-            await safe_edit(ctx.bot, chat_id, status.message_id,
-                f"{header}\n\n✅ *Success!*\n\n➡️ Agla item...")
-            await asyncio.sleep(1)
+            if not stopped:
+                await send_task; ok += 1
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
-            fail_up.append((name, f"upload: {str(e)[:200]}"))
-            await asyncio.sleep(1.5)
+            fail_up.append((name, str(e)[:200]))
         finally:
             wrapper.close()
             try: os.remove(out_path)
             except: pass
 
-    # ─── FINAL SUMMARY ───
-    final = (
-        f"✅ *ALL DONE* ({mode})\n\n"
-        f"📊 *Summary*\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"✔️ Uploaded:      {ok}/{total}\n"
-        f"❌ Verify fail:   {len(fail_verify)}\n"
-        f"❌ Download fail: {len(fail_dl)}\n"
-        f"❌ Upload fail:   {len(fail_up)}\n"
-    )
-    if fail_verify:
-        final += "\n*Verify Failures (pehle 5):*\n"
-        for n, e in fail_verify[:5]:
-            final += f"• `{n[:35]}` → {e[:80]}\n"
-    if fail_dl:
-        final += "\n*Download Failures (pehle 5):*\n"
-        for n, e in fail_dl[:5]:
-            final += f"• `{n[:35]}` → {e[:80]}\n"
-    if fail_up:
-        final += "\n*Upload Failures (pehle 5):*\n"
-        for n, e in fail_up[:5]:
-            final += f"• `{n[:35]}` → {e[:80]}\n"
+        if stopped: break
+
+    if stopped:
+        final = (f"🛑 *STOPPED*\n\n✔️ Uploaded: {ok}/{total}\n"
+                 f"❌ V:{len(fail_verify)} | DL:{len(fail_dl)} | UP:{len(fail_up)}")
+    else:
+        final = (f"✅ *DONE* ({mode})\n\n"
+                 f"✔️ Uploaded: {ok}/{total}\n"
+                 f"❌ V:{len(fail_verify)} | DL:{len(fail_dl)} | UP:{len(fail_up)}\n")
+        all_fails = fail_verify + fail_dl + fail_up
+        if all_fails:
+            final += "\n*Failures (pehle 5):*\n"
+            for n, e in all_fails[:5]:
+                final += f"• `{n[:30]}` → {e[:80]}\n"
 
     await safe_edit(ctx.bot, chat_id, status.message_id, final)
+    STOP_FLAGS.pop(user_id, None)
 
-# ───────── HANDLERS ─────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    mode = "🚀 2GB (Local API)" if USE_LOCAL_API else "⚠️ 50MB (Public API)"
+async def start_batch(update, ctx, items):
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+        ok_p, days = is_premium(user_id)
+        if not ok_p:
+            await update.message.reply_text(
+                "🚫 *Access Denied*\n\n"
+                "Aapke paas premium nahi hai.\n"
+                "Owner se contact karo premium lene ke liye.\n\n"
+                f"Aapki ID: `{user_id}`",
+                parse_mode="Markdown")
+            return
+
+    if user_id in CURRENT_TASK and not CURRENT_TASK[user_id].done():
+        await update.message.reply_text(
+            "⚠️ Ek batch chal rahi hai. `/stop` bhejo pehle.",
+            parse_mode="Markdown")
+        return
+    task = asyncio.create_task(process_items(update, ctx, items))
+    CURRENT_TASK[user_id] = task
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+# ═══════════════════════════════════════════════════════════
+#  👑 OWNER COMMANDS
+# ═══════════════════════════════════════════════════════════
+async def add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_owner(user_id):
+        await update.message.reply_text("🚫 Sirf owner ye command use kar sakta hai.")
+        return
+
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text(
+            "📝 *Usage:*\n"
+            "`/add <user_id> <days>`\n\n"
+            "Example:\n"
+            "`/add 123456789 30`\n"
+            "→ 30 din premium",
+            parse_mode="Markdown")
+        return
+
+    try:
+        target = int(ctx.args[0])
+        days   = int(ctx.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ user_id aur days number hone chahiye.")
+        return
+
+    if days <= 0:
+        await update.message.reply_text("❌ Days 1 se zyada hone chahiye.")
+        return
+
+    exp_str = add_premium(target, days, user_id)
+
     await update.message.reply_text(
-        f"🎬 Course Uploader Bot\n"
-        f"Mode: {mode}\n\n"
-        f"⚙️ *Sequential Process:*\n"
-        f"Har item pehle verify hoga → phir download → phir upload.\n"
-        f"Phir agla item same tarah.\n\n"
-        "📄 TXT Format:\n"
-        "GROUP\n"
-        "GROUP [VIDEO] Lesson 01 : https://...&token=...&userid=...\n"
-        "ya short:\n"
-        "GROUP [VIDEO] Lesson 01 : 30224|eyJhbGci...|464995\n\n"
-        "Use: /txt → .txt file bhejo",
-        parse_mode="Markdown"
-    )
+        f"✅ *Premium Added*\n\n"
+        f"👤 User: `{target}`\n"
+        f"📅 Days: +{days}\n"
+        f"⏰ Expires: {exp_str}",
+        parse_mode="Markdown")
+
+    try:
+        await ctx.bot.send_message(
+            target,
+            f"🎉 *Premium Activated!*\n\n"
+            f"Duration: {days} din\n"
+            f"Expires: {exp_str}\n\n"
+            f"Ab aap URL ya /txt bhej sakte ho.",
+            parse_mode="Markdown")
+    except Exception:
+        pass
+
+async def remove_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_owner(user_id):
+        await update.message.reply_text("🚫 Sirf owner.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: `/remove <user_id>`", parse_mode="Markdown")
+        return
+    try:
+        target = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id number hona chahiye.")
+        return
+
+    if remove_premium(target):
+        await update.message.reply_text(f"✅ `{target}` ka premium remove kar diya.", parse_mode="Markdown")
+        try:
+            await ctx.bot.send_message(target, "⚠️ Aapka premium remove kar diya gaya hai.")
+        except Exception:
+            pass
+    else:
+        await update.message.reply_text(f"ℹ️ `{target}` premium me nahi tha.", parse_mode="Markdown")
+
+async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_owner(user_id):
+        await update.message.reply_text("🚫 Sirf owner.")
+        return
+    users = load_users()
+    if not users:
+        await update.message.reply_text("📭 Koi premium user nahi.")
+        return
+
+    now = datetime.now()
+    lines = ["👥 *Premium Users*\n"]
+    active, expired = 0, 0
+    for uid, u in users.items():
+        try:
+            exp = datetime.fromisoformat(u["expires"])
+        except Exception:
+            continue
+        if exp > now:
+            d = (exp - now).days
+            lines.append(f"✅ `{uid}` → {d} din bache ({exp.strftime('%d %b %Y')})")
+            active += 1
+        else:
+            lines.append(f"❌ `{uid}` → expire ({exp.strftime('%d %b %Y')})")
+            expired += 1
+    lines.append(f"\n*Total:* {len(users)} | ✅ {active} | ❌ {expired}")
+    await update.message.reply_text("\n".join(lines)[:4000], parse_mode="Markdown")
+
+async def myid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.message.reply_text(
+        f"🆔 Aapki Telegram ID: `{uid}`\n\n"
+        f"Yeh ID owner ko do premium lene ke liye.",
+        parse_mode="Markdown")
+
+async def premium_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if is_owner(uid):
+        await update.message.reply_text("👑 Aap owner ho — unlimited access.")
+        return
+    ok_p, days = is_premium(uid)
+    if ok_p:
+        await update.message.reply_text(
+            f"✅ *Premium Active*\n\n"
+            f"⏰ {days} din bache hain.",
+            parse_mode="Markdown")
+    else:
+        await update.message.reply_text(
+            "🚫 Premium nahi hai.\n"
+            f"Aapki ID: `{uid}`\n"
+            "Owner se contact karo.",
+            parse_mode="Markdown")
+
+# ───────── GENERAL HANDLERS ─────────
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    mode = "🚀 2GB (Local API)" if USE_LOCAL_API else "⚠️ 50MB (Public API)"
+
+    if is_owner(uid):
+        access = "👑 Owner (unlimited)"
+    else:
+        ok_p, days = is_premium(uid)
+        access = f"✅ Premium ({days} din)" if ok_p else "🚫 No Premium"
+
+    await update.message.reply_text(
+        f"👋 *Course Uploader Bot*\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔧 Mode: {mode}\n"
+        f"📦 Max: {MAX_UPLOAD_MB} MB\n"
+        f"🎫 Access: {access}\n\n"
+        f"📌 *Kaise use karo:*\n"
+        f"• Koi bhi URL bhejo → upload hoga\n"
+        f"• /txt → TXT file batch upload\n"
+        f"• Name ke saath: `Lesson 01 : https://...`\n\n"
+        f"⚡ *Commands:*\n"
+        f"• /start — Ye info\n"
+        f"• /txt — TXT file mode\n"
+        f"• /stop — Batch rok do\n"
+        f"• /premium — Apna status\n"
+        f"• /myid — Apni ID dekho",
+        parse_mode="Markdown")
+
+async def help_cmd(update, ctx): await start(update, ctx)
+
+async def stop_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    STOP_FLAGS[uid] = True
+    task = CURRENT_TASK.get(uid)
+    if task and not task.done():
+        await update.message.reply_text(
+            "🛑 *Stop requested!*\nItem complete hote hi ruk jayega...",
+            parse_mode="Markdown")
+    else:
+        await update.message.reply_text("ℹ️ Koi active batch nahi.")
 
 async def txt_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        ok_p, _ = is_premium(uid)
+        if not ok_p:
+            await update.message.reply_text(
+                "🚫 Premium chahiye. /premium dekho.", parse_mode="Markdown")
+            return
     if update.message.reply_to_message and update.message.reply_to_message.document:
         await handle_txt_doc(update, ctx, update.message.reply_to_message.document)
         return
-    WAITING_TXT.add(update.effective_user.id)
+    WAITING_TXT.add(uid)
     await update.message.reply_text("📄 Ab .txt file bhejo (document).")
 
 async def handle_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -437,15 +674,30 @@ async def handle_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_txt_doc(update, ctx, doc):
     if not (doc.file_name or "").lower().endswith(".txt"):
-        await update.message.reply_text("❌ Sirf .txt file bhejo"); return
+        await update.message.reply_text("❌ .txt file bhejo"); return
     msg = await update.message.reply_text("📖 TXT padh raha hoon...")
     tg_file = await ctx.bot.get_file(doc.file_id)
     data = await tg_file.download_as_bytearray()
     items = parse_txt(data.decode("utf-8", errors="ignore"))
     if not items:
-        await msg.edit_text("❌ Koi valid URL / video_id nahi mila."); return
-    await msg.edit_text(f"✅ {len(items)} items mile. Sequential process start...")
-    await process_items(update, ctx, items)
+        await msg.edit_text("❌ Koi valid item nahi."); return
+    await msg.edit_text(f"✅ {len(items)} items. Start...")
+    await start_batch(update, ctx, items)
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text or text.startswith("/"): return
+    if not URL_RE.search(text):
+        await update.message.reply_text(
+            "❓ URL bhejo, ya /txt se TXT upload karo.\n"
+            "/start se info dekho.")
+        return
+    items = parse_txt(text)
+    if not items:
+        await update.message.reply_text("❌ Koi valid URL nahi mila.")
+        return
+    await update.message.reply_text(f"✅ {len(items)} item(s). Shuru...")
+    await start_batch(update, ctx, items)
 
 # ───────── MAIN ─────────
 def main():
@@ -455,10 +707,21 @@ def main():
                           .base_file_url(LOCAL_FILE_BASE)
                           .local_mode(True))
     app = builder.build()
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("txt", txt_cmd))
+    app.add_handler(CommandHandler("myid", myid_cmd))
+    app.add_handler(CommandHandler("premium", premium_cmd))
+    app.add_handler(CommandHandler("add", add_cmd))
+    app.add_handler(CommandHandler("remove", remove_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))
+
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-    print(f"🤖 Bot chalu... Mode: {'2GB' if USE_LOCAL_API else '50MB'}")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    print(f"🤖 Bot chalu... Mode: {'2GB' if USE_LOCAL_API else '50MB'} | Owner: {OWNER_ID}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
