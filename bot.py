@@ -1,26 +1,22 @@
 # ═══════════════════════════════════════════════
-#  ⚙️  CONFIG — SIRF YAHAN BADLO
+#  ⚙️  CONFIG — SIRF YAHAN 3 CHEEZEIN BADLO
 # ═══════════════════════════════════════════════
-BOT_TOKEN = "8933523621:AAHzHsW765IJ5Fl1rPSpdYsOI-Oc0m-03GE"   # ← BotFather se
+BOT_TOKEN = "8933523621:AAHzHsW765IJ5Fl1rPSpdYsOI-Oc0m-03GE"          # BotFather se
+API_ID    = "20346550"                       # my.telegram.org se
+API_HASH  = "bc79c3bea7a626887bdc0871eecf0327"            # my.telegram.org se
 
 # 🔹 Fixed API (pehle message wala)
 API_ENDPOINT = "https://appx-sign-urls-g-483856624945.herokuapp.com/fetch_video"
 API_HOST     = "armathsapi.akamai.net.in"
 COURSE_ID    = "41"
-# Agar TXT me userid nahi mile to ye use hoga
 FALLBACK_USERID = "464995"
-
-# 🔹 2GB upload chahiye? (Local Bot API Server alag Railway service)
-#   false = normal (50MB), true = 2GB
-USE_LOCAL_API   = False
-LOCAL_API_BASE  = "https://YOUR-BOT-API.up.railway.app/bot"
-LOCAL_FILE_BASE = "https://YOUR-BOT-API.up.railway.app/file/bot"
 # ═══════════════════════════════════════════════
 
 import os
 import re
 import time
 import asyncio
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import requests
@@ -29,6 +25,47 @@ from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes
 )
+
+# ───────── LOCAL BOT API SERVER START ─────────
+LOCAL_API_PORT = 8081
+LOCAL_API_DIR  = "/tmp/tg-bot-api"
+os.makedirs(LOCAL_API_DIR, exist_ok=True)
+
+def start_local_api_server():
+    """2GB upload enable karne ke liye local server."""
+    print("🚀 Local Bot API Server start ho raha...")
+    try:
+        subprocess.Popen([
+            "telegram-bot-api",
+            f"--api-id={API_ID}",
+            f"--api-hash={API_HASH}",
+            "--local",
+            f"--http-port={LOCAL_API_PORT}",
+            f"--dir={LOCAL_API_DIR}",
+        ])
+        time.sleep(4)
+        print("✅ Local API server ready (port", LOCAL_API_PORT, ")")
+        return True
+    except FileNotFoundError:
+        print("⚠️ telegram-bot-api binary nahi mili — 50MB mode me chalega")
+        return False
+    except Exception as e:
+        print(f"⚠️ Local API fail: {e} — 50MB mode")
+        return False
+
+LOCAL_API_OK = start_local_api_server()
+
+# ───────── CONFIG THAT DEPENDS ON LOCAL API ─────────
+if LOCAL_API_OK:
+    USE_LOCAL_API   = True
+    LOCAL_API_BASE  = f"http://localhost:{LOCAL_API_PORT}/bot"
+    LOCAL_FILE_BASE = f"http://localhost:{LOCAL_API_PORT}/file/bot"
+    MAX_UPLOAD_MB   = 2000
+else:
+    USE_LOCAL_API   = False
+    LOCAL_API_BASE  = "https://api.telegram.org/bot"
+    LOCAL_FILE_BASE = "https://api.telegram.org/file/bot"
+    MAX_UPLOAD_MB   = 50
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
@@ -57,14 +94,10 @@ async def safe_edit(bot, chat_id, msg_id, text):
         pass
 
 # ───────── API CALL + TOKEN VERIFY ─────────
-def call_api(course_id, video_id, token, userid):
-    """API call karo → signed URL. Token galat → PermissionError."""
+def call_api(video_id, token, userid):
     params = {
-        "api_base": API_HOST,
-        "course_id": str(course_id),
-        "video_id": str(video_id),
-        "token": token,
-        "userid": str(userid),
+        "api_base": API_HOST, "course_id": COURSE_ID,
+        "video_id": str(video_id), "token": token, "userid": str(userid),
     }
     r = requests.get(API_ENDPOINT, params=params, timeout=30)
     if r.status_code in (401, 403):
@@ -149,7 +182,7 @@ def resolve_signed_url(item):
         raise ValueError(f"URL nahi mila: {str(data)[:150]}")
 
     uid = item.get("userid") or FALLBACK_USERID
-    return call_api(COURSE_ID, item["video_id"], item["token"], uid)
+    return call_api(item["video_id"], item["token"], uid)
 
 # ───────── DOWNLOAD ─────────
 def download_file(url, out_dir, base, info):
@@ -217,7 +250,10 @@ async def process_items(update, ctx, items):
     total = len(items)
     loop = asyncio.get_event_loop()
 
-    status = await ctx.bot.send_message(chat_id, f"📋 {total} items. API verify...")
+    mode = "2GB (Local API)" if USE_LOCAL_API else "50MB (Public API)"
+    status = await ctx.bot.send_message(
+        chat_id, f"📋 {total} items. Mode: {mode}\n🔐 API verify..."
+    )
     ok, failed = 0, []
 
     for idx, item in enumerate(items, 1):
@@ -238,7 +274,7 @@ async def process_items(update, ctx, items):
         except Exception as e:
             failed.append((name, f"api: {str(e)[:100]}")); continue
 
-        # 2) Download with live speed
+        # 2) Download
         base = f"{user_id}_{idx}"
         dl_info = {"done": 0, "total": 0, "speed": 0}
         dl_task = loop.run_in_executor(
@@ -257,24 +293,30 @@ async def process_items(update, ctx, items):
         except Exception as e:
             failed.append((name, f"download: {str(e)[:100]}")); continue
 
-        size = os.path.getsize(out_path)
-        up_info = {"done": 0, "total": size, "speed": 0}
+        size_mb = os.path.getsize(out_path) / (1024 * 1024)
+        if size_mb > MAX_UPLOAD_MB:
+            failed.append((name, f"size {size_mb:.0f}MB > {MAX_UPLOAD_MB}MB"))
+            try: os.remove(out_path)
+            except: pass
+            continue
+
+        up_info = {"done": 0, "total": os.path.getsize(out_path), "speed": 0}
         wrapper = ProgressFile(str(out_path), up_info)
         caption = f"📁 {group}\n🎬 {name}\n🔖 {ftype}"[:1000]
 
-        # 3) Upload with live speed
+        # 3) Upload
         try:
             if ftype == "PDF":
                 coro = ctx.bot.send_document(
                     chat_id=chat_id, document=wrapper,
                     filename=f"{name[:60]}.pdf", caption=caption,
-                    read_timeout=1800, write_timeout=1800)
+                    read_timeout=7200, write_timeout=7200)
             else:
                 coro = ctx.bot.send_video(
                     chat_id=chat_id, video=wrapper,
                     filename=f"{name[:60]}.mp4", caption=caption,
                     supports_streaming=True,
-                    read_timeout=1800, write_timeout=1800)
+                    read_timeout=7200, write_timeout=7200)
         except Exception as e:
             wrapper.close()
             try: os.remove(out_path)
@@ -300,7 +342,7 @@ async def process_items(update, ctx, items):
             try: os.remove(out_path)
             except: pass
 
-    summary = f"✅ *Complete!*\n\n✔️ Success: {ok}/{total}\n"
+    summary = f"✅ *Complete!* ({mode})\n\n✔️ Success: {ok}/{total}\n"
     if failed:
         summary += f"\n❌ Failed: {len(failed)}\n"
         for n, e in failed[:15]:
@@ -309,8 +351,9 @@ async def process_items(update, ctx, items):
 
 # ───────── HANDLERS ─────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    mode = "🚀 2GB (Local API)" if USE_LOCAL_API else "⚠️ 50MB (Public API)"
     await update.message.reply_text(
-        "🎬 Course Uploader Bot\n\n"
+        f"🎬 Course Uploader Bot\nMode: {mode}\n\n"
         "📄 TXT Format:\n\n"
         "① Full URL:\n"
         "GROUP\n"
@@ -318,7 +361,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "② Short:\n"
         "GROUP\n"
         "GROUP [VIDEO] Lesson 01 : 30224|eyJhbGci...|464995\n\n"
-        "Use: /txt → .txt file bhejo → auto verify + download + upload"
+        "Use: /txt → .txt bhejo → auto verify + download + upload"
     )
 
 async def txt_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -356,7 +399,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("txt", txt_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-    print("🤖 Bot chalu...")
+    print(f"🤖 Bot chalu... Mode: {'2GB' if USE_LOCAL_API else '50MB'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
