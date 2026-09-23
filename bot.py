@@ -19,7 +19,7 @@ import asyncio
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 import requests
 import jwt
 import yt_dlp
@@ -91,9 +91,9 @@ STOP_FLAGS   = {}
 CURRENT_TASK = {}
 
 MEDIA_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv",
-              ".mp3", ".m4a", ".pdf", ".zip", ".rar", ".ts")
+              ".mp3", ".m4a", ".pdf", ".zip", ".rar", ".ts", ".apk")
 
-# 🔥 Updated default caption — Download By added
+# 🔥 Updated default caption
 DEFAULT_CAPTION = (
     "[📁] File_ID : {file_index}\n\n"
     "NAME  : {file_name}\n\n"
@@ -265,7 +265,7 @@ def resolve_url(url, user_id=None):
     return url
 
 # ═══════════════════════════════════════════════════════════
-#  🖼️ THUMBNAIL + DURATION (FIXED)
+#  🖼️ THUMBNAIL + DURATION
 # ═══════════════════════════════════════════════════════════
 def generate_thumbnail(video_path: Path, out_path: Path, seek_sec: int = 5) -> bool:
     try:
@@ -288,13 +288,8 @@ def generate_thumbnail(video_path: Path, out_path: Path, seek_sec: int = 5) -> b
 
 
 def get_media_info(path) -> dict:
-    """
-    🔥 FIXED — Duration, width, height teeno nikalo.
-    Format se pehle, phir stream se fallback.
-    """
     info = {"duration": 0.0, "width": 0, "height": 0}
     try:
-        # Duration from format
         r = subprocess.run([
             "ffprobe", "-v", "error",
             "-show_entries", "format=duration",
@@ -306,7 +301,6 @@ def get_media_info(path) -> dict:
         except Exception:
             pass
 
-        # Fallback: video stream duration
         if info["duration"] <= 0:
             r = subprocess.run([
                 "ffprobe", "-v", "error",
@@ -320,7 +314,6 @@ def get_media_info(path) -> dict:
             except Exception:
                 pass
 
-        # Width / Height
         r = subprocess.run([
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
@@ -419,7 +412,7 @@ def is_stopped(user_id):
     return STOP_FLAGS.get(user_id, False)
 
 # ═══════════════════════════════════════════════════════════
-#  📄 TXT PARSER (🔥 SMART — line break safe)
+#  📄 TXT PARSER
 # ═══════════════════════════════════════════════════════════
 URL_RE   = re.compile(r"(https?://\S+)")
 TYPE_RE  = re.compile(r"\[(VIDEO|PDF)\]", re.I)
@@ -431,17 +424,11 @@ SHORT_RE = re.compile(
 def url_basename(url: str) -> str:
     """URL se filename nikalo (query string hatao)."""
     clean = url.split("?")[0].split("#")[0]
-    name = clean.rstrip("/").split("/")[-1]
+    name = unquote(clean.rstrip("/").split("/")[-1])
     return name or "file"
 
 
 def parse_txt(text):
-    """
-    🔥 FIXED Parser:
-      - Agar line me "Name URL" dono hai → name wahi use karo
-      - Agar line me sirf URL → pichli line ka text name banao
-      - Agar pichli line bhi nahi → URL basename use karo
-    """
     items = []
     pending_name = None
 
@@ -493,17 +480,15 @@ def parse_txt(text):
             continue
 
         # ─── NO URL — line ko "pending name" banao ───
-        # Agar already pending hai, use overwrite na karo (group header hoga)
         if not pending_name:
             pending_name = line.rstrip(":").strip()
         else:
-            # Purana discard, naya use karo
             pending_name = line.rstrip(":").strip()
 
     return items
 
 # ═══════════════════════════════════════════════════════════
-#  📥 DOWNLOAD
+#  📥 DOWNLOAD (🔥 FIXED — 403 bypass + direct download)
 # ═══════════════════════════════════════════════════════════
 def download_file(url, out_dir, base, info, user_id=None):
     def hook(d):
@@ -521,6 +506,71 @@ def download_file(url, out_dir, base, info, user_id=None):
             if user_id and is_stopped(user_id):
                 raise yt_dlp.utils.DownloadError("User stopped")
 
+    # 🔥 Browser jaisa headers — 403 block bypass karne ke liye
+    browser_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "Referer": f"https://{urlparse(url).netloc}/",
+    }
+
+    # 🔥 APK, ZIP, PDF, EXE jaise generic files ke liye direct download (yt-dlp bypass)
+    ext_check = url.lower().split("?")[0]
+    generic_exts = (".apk", ".zip", ".rar", ".pdf", ".exe", ".apks", ".xapk")
+    if any(ext_check.endswith(e) for e in generic_exts):
+        print(f"📥 Direct download: {url[:80]}")
+        try:
+            with requests.get(url, headers=browser_headers, stream=True,
+                              timeout=120, allow_redirects=True) as r:
+                if r.status_code >= 400:
+                    raise ValueError(f"HTTP {r.status_code}")
+                total = int(r.headers.get("Content-Length", 0))
+                info["total"] = total
+                ext = os.path.splitext(url.split("?")[0])[1] or ".bin"
+                out_path = out_dir / f"{base}{ext}"
+
+                # Extension double hone se bachao (e.g. file.apk.apk)
+                if out_path.name.count(".") > 1:
+                    parts = out_path.name.split(".")
+                    if parts[-1] == parts[-2]:
+                        out_path = out_dir / f"{base}.{parts[-1]}"
+
+                with open(out_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            f.write(chunk)
+                            info["done"] += len(chunk)
+                            t = time.time()
+                            if info.get("_t"):
+                                dt = t - info["_t"]
+                                if dt >= 0.5:
+                                    info["speed"] = (
+                                        info["done"] - info["_b"]
+                                    ) / dt
+                                    info["_t"], info["_b"] = t, info["done"]
+                            else:
+                                info["_t"], info["_b"] = t, info["done"]
+                            if user_id and is_stopped(user_id):
+                                f.close()
+                                os.remove(out_path)
+                                raise yt_dlp.utils.DownloadError("User stopped")
+                return out_path
+        except Exception as e:
+            print(f"⚠️ Direct fail: {e}, yt-dlp try kar raha...")
+            # Neeche yt-dlp fallback
+
+    # ─── yt-dlp fallback (video/audio files ke liye) ───
     opts = {
         "outtmpl": str(out_dir / f"{base}.%(ext)s"),
         "format": "best[ext=mp4]/best",
@@ -528,11 +578,7 @@ def download_file(url, out_dir, base, info, user_id=None):
         "progress_hooks": [hook],
         "retries": 10, "fragment_retries": 10,
         "socket_timeout": 30,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "*/*",
-            "Referer": f"https://{AKAMAI_HOST}/",
-        },
+        "http_headers": browser_headers,
     }
     with yt_dlp.YoutubeDL(opts) as y:
         y.download([url])
@@ -596,7 +642,6 @@ async def process_items(update, ctx, items, batch_label=""):
     total = len(items)
     mode = "4GB" if USE_LOCAL_API else "50MB"
 
-    # User ka display name
     u = update.effective_user
     downloaded_by = u.first_name or u.username or str(user_id)
     if u.last_name:
@@ -689,10 +734,11 @@ async def process_items(update, ctx, items, batch_label=""):
             except: pass
             stopped = True; break
 
-        # THUMBNAIL + MEDIA INFO (FIXED — duration ab milta hai)
+        # THUMBNAIL + MEDIA INFO
         thumb_path = None
         media_info = {"duration": 0.0, "width": 0, "height": 0}
-        is_video = out_path.suffix.lower() not in (".pdf", ".mp3", ".m4a", ".zip", ".rar")
+        is_video = out_path.suffix.lower() not in (".pdf", ".mp3", ".m4a",
+                                                   ".zip", ".rar", ".apk")
 
         if is_video:
             t_path = THUMB_DIR / f"{base}.jpg"
@@ -707,11 +753,15 @@ async def process_items(update, ctx, items, batch_label=""):
         # CAPTION
         cap = get_user_caption(user_id)
         ext = out_path.suffix.lower().lstrip(".")
-        display_name = f"{name[:60]}.{ext}" if ext else f"{name[:60]}.mp4"
+        # Extension double hone se bachao
+        name_clean = name
+        if name_clean.lower().endswith(f".{ext.lower()}"):
+            name_clean = name_clean[:-(len(ext) + 1)]
+        display_name = f"{name_clean[:60]}.{ext}" if ext else f"{name_clean[:60]}.mp4"
 
         if cap["enabled"]:
             values = {
-                "file_name": name,
+                "file_name": name_clean,
                 "file_size": fmt_size(os.path.getsize(out_path)),
                 "file_extension": ext or "file",
                 "file_duration": fmt_duration(media_info["duration"]),
@@ -736,8 +786,13 @@ async def process_items(update, ctx, items, batch_label=""):
                     filename=display_name, caption=caption,
                     thumbnail=thumb_fh,
                     read_timeout=7200, write_timeout=7200)
+            elif ext in ("apk", "zip", "rar"):
+                # Generic files → document ke roop me bhejo
+                coro = ctx.bot.send_document(
+                    chat_id=chat_id, document=wrapper,
+                    filename=display_name, caption=caption,
+                    read_timeout=7200, write_timeout=7200)
             else:
-                # 🔥 FIXED — duration, width, height explicitly bhejo
                 coro = ctx.bot.send_video(
                     chat_id=chat_id, video=wrapper,
                     filename=display_name, caption=caption,
@@ -1099,7 +1154,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text or text.startswith("/"): return
 
-    # CAPTION UPDATE MODE
     if WAITING_CAPTION.get(uid):
         WAITING_CAPTION.pop(uid, None)
         if len(text) > 900:
@@ -1112,7 +1166,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=caption_keyboard(uid))
         return
 
-    # URL MODE
     if not URL_RE.search(text):
         await update.message.reply_text("❓ URL bhejo ya /txt se TXT upload karo.")
         return
