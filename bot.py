@@ -467,7 +467,7 @@ def parse_txt(text):
     return items
 
 # ═══════════════════════════════════════════════════════════
-#  📥 DOWNLOAD — yt-dlp (YouTube fix + cookies)
+#  📥 DOWNLOAD — FIXED (Exact path + mp4 force)
 # ═══════════════════════════════════════════════════════════
 def download_file(url, out_dir, base, info, user_id=None):
     def hook(d):
@@ -504,13 +504,13 @@ def download_file(url, out_dir, base, info, user_id=None):
     opts = {
         "outtmpl": str(out_dir / f"{base}.%(ext)s"),
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "merge_output_format": "mp4",
         "quiet": True, "no_warnings": True, "noplaylist": True,
         "progress_hooks": [hook],
         "retries": 5, "fragment_retries": 5,
         "socket_timeout": 30,
         "http_headers": browser_headers,
         "cookiefile": str(COOKIES_FILE) if has_cookies else None,
-        # 🔥 YOUTUBE FIX — naye clients + PO token bypass
         "extractor_args": {
             "youtube": {
                 "player_client": [
@@ -526,14 +526,50 @@ def download_file(url, out_dir, base, info, user_id=None):
         },
         "nocheckcertificate": True,
         "geo_bypass": True,
+        "postprocessors": [{
+            "key": "FFmpegVideoRemuxer",
+            "preferedformat": "mp4",
+        }],
     }
-    with yt_dlp.YoutubeDL(opts) as y:
-        y.download([url])
 
-    files = [f for f in out_dir.glob(f"{base}.*") if f.is_file()]
-    if not files:
-        raise FileNotFoundError("Downloaded file missing")
-    f = files[0]
+    final_path = None
+    with yt_dlp.YoutubeDL(opts) as y:
+        result = y.extract_info(url, download=True)
+
+        # Method 1: yt-dlp se exact path
+        if result.get("requested_downloads"):
+            rd = result["requested_downloads"][0]
+            fp = rd.get("filepath")
+            if fp and os.path.exists(fp):
+                final_path = fp
+
+        # Method 2: common extensions check
+        if not final_path:
+            for ext in [".mp4", ".mkv", ".webm", ".m4a", ".mp3", ".mov"]:
+                p = out_dir / f"{base}{ext}"
+                if p.exists() and p.stat().st_size > 10 * 1024:
+                    final_path = str(p)
+                    break
+
+        # Method 3: glob — par .part aur .fXXX fragment ignore
+        if not final_path:
+            all_files = [
+                f for f in out_dir.glob(f"{base}.*")
+                if f.is_file()
+                and not f.name.endswith(".part")
+                and ".f" not in f.name
+            ]
+            if all_files:
+                all_files.sort(key=lambda x: x.stat().st_size, reverse=True)
+                final_path = str(all_files[0])
+
+        if not final_path:
+            for f in out_dir.glob(f"{base}.*"):
+                try: f.unlink()
+                except: pass
+            raise FileNotFoundError("Downloaded file missing")
+
+    f = Path(final_path)
     size = f.stat().st_size
     if size < 10 * 1024:
         try:
@@ -542,7 +578,8 @@ def download_file(url, out_dir, base, info, user_id=None):
                 f.unlink()
                 raise ValueError("HTML page — ye video nahi hai")
         except Exception: pass
-        f.unlink()
+        try: f.unlink()
+        except: pass
         raise ValueError(f"File bahut chhota ({size} bytes)")
 
     ext = f.suffix.lower()
@@ -554,6 +591,8 @@ def download_file(url, out_dir, base, info, user_id=None):
             elif head[:4] == b"%PDF":
                 new = f.with_suffix(".pdf"); f.rename(new); f = new
         except Exception: pass
+
+    print(f"✅ Final file: {f.name} ({size/1024/1024:.1f} MB) ext={f.suffix}")
     return f
 
 # ───────── UPLOAD PROGRESS ─────────
