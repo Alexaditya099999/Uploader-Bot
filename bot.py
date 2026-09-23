@@ -84,13 +84,22 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 THUMB_DIR    = Path("thumbs")
 THUMB_DIR.mkdir(exist_ok=True)
 DATA_FILE    = Path("users.json")
+CAPTIONS_FILE = Path("captions.json")
 
 WAITING_TXT  = {}
+WAITING_CAPTION = {}
 STOP_FLAGS   = {}
 CURRENT_TASK = {}
 
 MEDIA_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv",
               ".mp3", ".m4a", ".pdf", ".zip", ".rar", ".ts")
+
+DEFAULT_CAPTION = (
+    "[📁] File_ID : {file_index}\n\n"
+    "NAME  : {file_name}\n\n"
+    "💼  Size : {file_size}\n\n"
+    "📚 BATCH NAME : {batch_name}"
+)
 
 # ═══════════════════════════════════════════════════════════
 #  💾 PREMIUM STORAGE
@@ -145,6 +154,59 @@ def remove_premium(user_id) -> bool:
 
 def is_owner(user_id) -> bool:
     return int(user_id) == int(OWNER_ID)
+
+# ═══════════════════════════════════════════════════════════
+#  🎨 CAPTION STORAGE
+# ═══════════════════════════════════════════════════════════
+def load_captions() -> dict:
+    if not CAPTIONS_FILE.exists(): return {}
+    try: return json.loads(CAPTIONS_FILE.read_text())
+    except Exception: return {}
+
+
+def save_captions(data: dict):
+    try: CAPTIONS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception as e: print(f"⚠️ Save caption fail: {e}")
+
+
+def get_user_caption(uid) -> dict:
+    caps = load_captions()
+    c = caps.get(str(uid), {})
+    return {
+        "enabled": c.get("enabled", True),
+        "template": c.get("template", DEFAULT_CAPTION),
+    }
+
+
+def set_caption_enabled(uid, enabled: bool):
+    caps = load_captions()
+    c = caps.get(str(uid), {})
+    c["enabled"] = enabled
+    caps[str(uid)] = c
+    save_captions(caps)
+
+
+def set_caption_template(uid, template: str):
+    caps = load_captions()
+    c = caps.get(str(uid), {})
+    c["template"] = template
+    caps[str(uid)] = c
+    save_captions(caps)
+
+
+def reset_caption(uid):
+    caps = load_captions()
+    c = caps.get(str(uid), {})
+    c["template"] = DEFAULT_CAPTION
+    caps[str(uid)] = c
+    save_captions(caps)
+
+
+def render_caption(template: str, values: dict) -> str:
+    out = template
+    for k, v in values.items():
+        out = out.replace("{" + k + "}", str(v))
+    return out
 
 # ═══════════════════════════════════════════════════════════
 #  🎯 URL HANDLING
@@ -202,11 +264,11 @@ def resolve_url(url, user_id=None):
     return url
 
 # ═══════════════════════════════════════════════════════════
-#  🖼️ THUMBNAIL GENERATOR
+#  🖼️ THUMBNAIL + DURATION
 # ═══════════════════════════════════════════════════════════
 def generate_thumbnail(video_path: Path, out_path: Path, seek_sec: int = 5) -> bool:
     try:
-        r = subprocess.run([
+        subprocess.run([
             "ffmpeg", "-y", "-ss", str(seek_sec), "-i", str(video_path),
             "-vframes", "1", "-vf", "scale=320:-1", "-q:v", "5",
             str(out_path)
@@ -222,6 +284,17 @@ def generate_thumbnail(video_path: Path, out_path: Path, seek_sec: int = 5) -> b
     except Exception as e:
         print(f"⚠️ Thumb fail: {e}")
         return False
+
+
+def get_duration(path) -> float:
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+        ], capture_output=True, timeout=15, text=True)
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
 
 # ───────── HELPERS ─────────
 def fmt_size(b):
@@ -252,6 +325,15 @@ def fmt_eta_fancy(secs):
     if m < 60: return f"{m}m, {s}s"
     h, m = divmod(m, 60)
     return f"{h}h, {m}m"
+
+
+def fmt_duration(secs):
+    if not secs or secs <= 0: return "N/A"
+    secs = int(secs)
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h: return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 def make_bar(pct, width=20):
@@ -333,7 +415,7 @@ def parse_txt(text):
     return items
 
 # ═══════════════════════════════════════════════════════════
-#  📥 DOWNLOAD (with strict validation)
+#  📥 DOWNLOAD — 🔥 FIXED (No chunk/parallel breaks)
 # ═══════════════════════════════════════════════════════════
 def download_file(url, out_dir, base, info, user_id=None):
     def hook(d):
@@ -351,31 +433,32 @@ def download_file(url, out_dir, base, info, user_id=None):
             if user_id and is_stopped(user_id):
                 raise yt_dlp.utils.DownloadError("User stopped")
 
+    # 🔥 Simple, reliable options — no http_chunk_size, no concurrent_fragment
     opts = {
         "outtmpl": str(out_dir / f"{base}.%(ext)s"),
         "format": "best[ext=mp4]/best",
-        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
         "progress_hooks": [hook],
-        "concurrent_fragment_downloads": 16,
-        "http_chunk_size": 10485760,
-        "buffersize": 1024 * 1024,
-        "retries": 5, "fragment_retries": 5,
+        "retries": 10,
+        "fragment_retries": 10,
+        "socket_timeout": 30,
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
             "Referer": f"https://{AKAMAI_HOST}/",
         },
     }
     with yt_dlp.YoutubeDL(opts) as y:
         y.download([url])
 
-    # ✅ Strict validation — HTML page ya chhota file reject karo
     files = [f for f in out_dir.glob(f"{base}.*") if f.is_file()]
     if not files:
         raise FileNotFoundError("Downloaded file missing")
     f = files[0]
     size = f.stat().st_size
-    if size < 10 * 1024:  # 10KB se chhota → kaam nahi karega
-        # HTML check
+    if size < 10 * 1024:
         try:
             head = f.read_bytes()[:200].lower()
             if b"<html" in head or b"<!doctype" in head:
@@ -385,20 +468,15 @@ def download_file(url, out_dir, base, info, user_id=None):
         f.unlink()
         raise ValueError(f"File bahut chhota ({size} bytes)")
 
-    # extension check (bahut zaroori)
     ext = f.suffix.lower()
     if ext not in MEDIA_EXTS and ext != "":
-        # Kabhi kabhi extension nahi hota — content-type check
         try:
             head = f.read_bytes()[:16]
-            if head[4:8] == b"ftyp":  # MP4 signature
-                new = f.with_suffix(".mp4")
-                f.rename(new); f = new
+            if head[4:8] == b"ftyp":
+                new = f.with_suffix(".mp4"); f.rename(new); f = new
             elif head[:4] == b"%PDF":
-                new = f.with_suffix(".pdf")
-                f.rename(new); f = new
+                new = f.with_suffix(".pdf"); f.rename(new); f = new
         except Exception: pass
-
     return f
 
 # ───────── UPLOAD PROGRESS ─────────
@@ -452,7 +530,7 @@ async def process_items(update, ctx, items, batch_label=""):
     )
 
     ok = 0
-    failed = []  # (idx, name, stage, error)
+    failed = []
     stopped = False
 
     for idx, item in enumerate(items, 1):
@@ -465,7 +543,7 @@ async def process_items(update, ctx, items, batch_label=""):
         header = (f"📦 Item {idx}/{total}\n"
                   f"📁 {group}\n🎬 {name}\n🔖 {ftype}")
 
-        # ─── STEP 1: VERIFY ───
+        # STEP 1: VERIFY
         await safe_edit(ctx.bot, chat_id, status.message_id,
                         f"{header}\n\n🔐 Step 1/3 — Verifying...", cancel_kb)
         if is_stopped(user_id):
@@ -480,7 +558,7 @@ async def process_items(update, ctx, items, batch_label=""):
         if is_stopped(user_id):
             stopped = True; break
 
-        # ─── STEP 2: DOWNLOAD ───
+        # STEP 2: DOWNLOAD
         base = f"{user_id}_{idx}"
         dl_info = {"done": 0, "total": 0, "speed": 0}
         dl_task = loop.run_in_executor(
@@ -495,7 +573,6 @@ async def process_items(update, ctx, items, batch_label=""):
             await safe_edit(ctx.bot, chat_id, status.message_id, txt, cancel_kb)
 
         if stopped:
-            # 🔥 FIX: dono await nahi, cleanup fire-and-forget
             async def _cleanup_dl(t=dl_task):
                 try:
                     p = await t
@@ -522,7 +599,7 @@ async def process_items(update, ctx, items, batch_label=""):
             except: pass
             stopped = True; break
 
-        # ─── THUMBNAIL ───
+        # THUMBNAIL
         thumb_path = None
         if out_path.suffix.lower() not in (".pdf", ".mp3", ".m4a", ".zip", ".rar"):
             t_path = THUMB_DIR / f"{base}.jpg"
@@ -530,22 +607,35 @@ async def process_items(update, ctx, items, batch_label=""):
                 None, generate_thumbnail, out_path, t_path)
             if ok_thumb: thumb_path = t_path
 
-        # ─── STEP 3: UPLOAD ───
+        # CAPTION
+        cap = get_user_caption(user_id)
+        ext = out_path.suffix.lower().lstrip(".")
+        display_name = f"{name[:60]}.{ext}" if ext else f"{name[:60]}.mp4"
+
+        if cap["enabled"]:
+            duration = 0.0
+            if ext in ("mp4", "mkv", "webm", "mov", "m4v", "avi", "flv", "ts"):
+                duration = await loop.run_in_executor(None, get_duration, out_path)
+            values = {
+                "file_name": name,
+                "file_size": fmt_size(os.path.getsize(out_path)),
+                "file_extension": ext or "file",
+                "file_duration": fmt_duration(duration),
+                "file_url": item["url"],
+                "file_index": idx,
+                "batch_name": batch_label or "Direct",
+            }
+            caption = render_caption(cap["template"], values)[:1024]
+        else:
+            caption = None
+
+        # STEP 3: UPLOAD
         up_info = {"done": 0, "total": os.path.getsize(out_path), "speed": 0}
         wrapper = ProgressFile(str(out_path), up_info)
 
-        ext = out_path.suffix.lower()
-        display_name = f"{name[:60]}{ext}" if ext else f"{name[:60]}.mp4"
-
-        caption = (
-            f"[📁] File_ID : {idx}\n"
-            f"NAME : {display_name}\n\n"
-            f"📁 {group}\n🎬 {name}\n🔖 {ftype}"
-        )[:1024]
-
         thumb_fh = open(thumb_path, "rb") if thumb_path else None
         try:
-            if ext == ".pdf" or ftype == "PDF":
+            if ext == "pdf" or ftype == "PDF":
                 coro = ctx.bot.send_document(
                     chat_id=chat_id, document=wrapper,
                     filename=display_name, caption=caption,
@@ -592,7 +682,7 @@ async def process_items(update, ctx, items, batch_label=""):
 
         if stopped: break
 
-    # ─── SUMMARY ───
+    # SUMMARY
     if stopped:
         final = (f"🛑 *STOPPED*\n\n"
                  f"✔️ Uploaded: {ok}/{total}\n"
@@ -614,7 +704,6 @@ async def process_items(update, ctx, items, batch_label=""):
 
 
 async def start_batch(update, ctx, items, batch_label=""):
-    """🔥 Fire-and-forget — handler block nahi hoga, doosre user kaam kar sakte hain."""
     user_id = update.effective_user.id
 
     if not is_owner(user_id):
@@ -627,22 +716,118 @@ async def start_batch(update, ctx, items, batch_label=""):
                 parse_mode="Markdown")
             return
 
-    # Same user ka purana task chal raha ho to skip
     if user_id in CURRENT_TASK and not CURRENT_TASK[user_id].done():
         await update.message.reply_text(
             "⚠️ Aapki ek batch chal rahi hai. /stop bhejo pehle.")
         return
 
-    # 🔥 Task create karo — await NAHI karo
     task = asyncio.create_task(process_items(update, ctx, items, batch_label))
     CURRENT_TASK[user_id] = task
 
-    # Done hone pe dict se hata do
     def _done(t):
         if CURRENT_TASK.get(user_id) is t:
             CURRENT_TASK.pop(user_id, None)
         STOP_FLAGS.pop(user_id, None)
     task.add_done_callback(_done)
+
+# ═══════════════════════════════════════════════════════════
+#  🎨 CAPTION COMMAND
+# ═══════════════════════════════════════════════════════════
+def build_caption_menu(uid) -> str:
+    cap = get_user_caption(uid)
+    status = "Enabled" if cap["enabled"] else "Disabled"
+    return (
+        "Set Caption\n\n"
+        "➤ Available Variables 📌\n\n"
+        "🎙 Name : {file_name}\n"
+        "📦 Size : {file_size}\n"
+        "⚙️ Extension : {file_extension}\n"
+        "⏱ Duration : {file_duration}\n"
+        "🔗 Link : {file_url}\n"
+        "🔢 Index : {file_index}\n"
+        "📚 Batch Name : {batch_name}\n\n"
+        "═══════════════════════\n\n"
+        "➤ Current:\n"
+        f"{cap['template']}\n\n"
+        "═══════════════════════\n\n"
+        "➤ Default:\n"
+        f"{DEFAULT_CAPTION}\n\n"
+        f"➤ Status: {status}"
+    )
+
+
+def caption_keyboard(uid):
+    cap = get_user_caption(uid)
+    toggle_text = "🔴 DISABLE" if cap["enabled"] else "🟢 ENABLE"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_text, callback_data="cap:toggle")],
+        [InlineKeyboardButton("✏️ UPDATE CAPTION", callback_data="cap:update")],
+        [InlineKeyboardButton("↺ RESET DEFAULT", callback_data="cap:reset")],
+        [InlineKeyboardButton("🔙 BACK", callback_data="cap:back")],
+    ])
+
+
+async def caption_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        ok_p, _ = is_premium(uid)
+        if not ok_p:
+            await update.message.reply_text(
+                f"🚫 Premium chahiye. Aapki ID: `{uid}`",
+                parse_mode="Markdown")
+            return
+    await update.message.reply_text(
+        build_caption_menu(uid),
+        reply_markup=caption_keyboard(uid))
+
+
+async def caption_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    action = q.data.split(":", 1)[1]
+
+    if action == "toggle":
+        cap = get_user_caption(uid)
+        set_caption_enabled(uid, not cap["enabled"])
+        await q.answer("✅ Toggled!")
+        await q.edit_message_text(build_caption_menu(uid),
+                                  reply_markup=caption_keyboard(uid))
+
+    elif action == "update":
+        WAITING_CAPTION[uid] = True
+        await q.answer("Send new template")
+        await q.edit_message_text(
+            "✏️ *Caption Template Update*\n\n"
+            "Naya template bhejo (text message).\n\n"
+            "Variables: `{file_name}` `{file_size}` `{file_extension}` "
+            "`{file_duration}` `{file_url}` `{file_index}` `{batch_name}`\n\n"
+            "Example:\n"
+            "```\n🎬 {file_name}\n📦 {file_size}\n🔢 #{file_index}\n```\n\n"
+            "/cancel bhejo to rok do.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 BACK", callback_data="cap:back")]
+            ]))
+
+    elif action == "reset":
+        reset_caption(uid)
+        await q.answer("✅ Reset!")
+        await q.edit_message_text(build_caption_menu(uid),
+                                  reply_markup=caption_keyboard(uid))
+
+    elif action == "back":
+        await q.answer()
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+
+
+async def cancel_caption_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if WAITING_CAPTION.get(uid):
+        WAITING_CAPTION.pop(uid, None)
+        await update.message.reply_text("❌ Caption update cancel.")
+    else:
+        await update.message.reply_text("ℹ️ Kuch cancel karne ko nahi tha.")
 
 # ═══════════════════════════════════════════════════════════
 #  👑 OWNER COMMANDS
@@ -696,8 +881,7 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try: exp = datetime.fromisoformat(u["expires"])
         except Exception: continue
         if exp > now:
-            lines.append(f"✅ {uid} → {(exp-now).days} din")
-            a += 1
+            lines.append(f"✅ {uid} → {(exp-now).days} din"); a += 1
         else:
             lines.append(f"❌ {uid} → expire"); e += 1
     lines.append(f"\nTotal: {len(users)} | ✅ {a} | ❌ {e}")
@@ -729,17 +913,20 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         ok_p, days = is_premium(uid)
         access = f"✅ Premium ({days}d)" if ok_p else "🚫 No Premium"
+
     await update.message.reply_text(
         f"👋 *Course Uploader Bot*\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🔧 Mode: {mode}\n"
         f"📦 Max: {MAX_UPLOAD_MB} MB\n"
         f"🎫 {access}\n\n"
-        f"• URL bhejo → upload\n"
-        f"• /txt → TXT batch\n"
-        f"• /stop → rok do\n"
-        f"• /premium → status\n"
-        f"• /myid → ID",
+        f"⚡ *Commands:*\n"
+        f"• /start /help — Info\n"
+        f"• /txt — TXT batch\n"
+        f"• /stop — Rok do\n"
+        f"• /caption — Custom caption\n"
+        f"• /premium — Status\n"
+        f"• /myid — ID",
         parse_mode="Markdown")
 
 
@@ -798,7 +985,7 @@ async def handle_txt_doc(update, ctx, doc):
         data = await tg_file.download_as_bytearray()
         items = parse_txt(data.decode("utf-8", errors="ignore"))
     except Exception as e:
-        await msg.edit_text(f"❌ TXT padhne me error: {str(e)[:150]}"); return
+        await msg.edit_text(f"❌ TXT error: {str(e)[:150]}"); return
     if not items:
         await msg.edit_text("❌ Koi valid item nahi."); return
     batch_name = (doc.file_name or "TXT")[:60]
@@ -807,8 +994,24 @@ async def handle_txt_doc(update, ctx, doc):
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     text = (update.message.text or "").strip()
     if not text or text.startswith("/"): return
+
+    # CAPTION UPDATE MODE
+    if WAITING_CAPTION.get(uid):
+        WAITING_CAPTION.pop(uid, None)
+        if len(text) > 900:
+            await update.message.reply_text("❌ Template bahut bada (max 900).")
+            return
+        set_caption_template(uid, text)
+        await update.message.reply_text("✅ Caption template updated!")
+        await update.message.reply_text(
+            build_caption_menu(uid),
+            reply_markup=caption_keyboard(uid))
+        return
+
+    # URL MODE
     if not URL_RE.search(text):
         await update.message.reply_text("❓ URL bhejo ya /txt se TXT upload karo.")
         return
@@ -822,7 +1025,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     builder = (Application.builder()
                .token(BOT_TOKEN)
-               .concurrent_updates(16))  # 🔥 multiple users ek saath
+               .concurrent_updates(16))
     if USE_LOCAL_API:
         builder = (builder.base_url(LOCAL_API_BASE)
                           .base_file_url(LOCAL_FILE_BASE)
@@ -833,17 +1036,21 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("txt", txt_cmd))
+    app.add_handler(CommandHandler("caption", caption_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_caption_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("premium", premium_cmd))
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
 
+    app.add_handler(CallbackQueryHandler(caption_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(cancel_cb, pattern=r"^cancel:"))
+
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print(f"🤖 Bot chalu... Mode: {'4GB' if USE_LOCAL_API else '50MB'} | Concurrent: 16")
+    print(f"🤖 Bot chalu... Mode: {'4GB' if USE_LOCAL_API else '50MB'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
