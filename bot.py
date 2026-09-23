@@ -467,7 +467,7 @@ def parse_txt(text):
     return items
 
 # ═══════════════════════════════════════════════════════════
-#  📥 DOWNLOAD — yt-dlp only (cookies ke saath)
+#  📥 DOWNLOAD — yt-dlp (YouTube fix + cookies)
 # ═══════════════════════════════════════════════════════════
 def download_file(url, out_dir, base, info, user_id=None):
     def hook(d):
@@ -490,7 +490,7 @@ def download_file(url, out_dir, base, info, user_id=None):
     if has_cookies:
         print(f"🍪 Using cookies ({COOKIES_FILE.stat().st_size} bytes)")
     else:
-        print("⚠️ Cookies nahi — YouTube/IG fail ho sakte hain")
+        print("⚠️ Cookies nahi")
 
     browser_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -510,12 +510,22 @@ def download_file(url, out_dir, base, info, user_id=None):
         "socket_timeout": 30,
         "http_headers": browser_headers,
         "cookiefile": str(COOKIES_FILE) if has_cookies else None,
+        # 🔥 YOUTUBE FIX — naye clients + PO token bypass
         "extractor_args": {
             "youtube": {
-                "player_client": ["web", "android", "ios", "tv_embedded"],
+                "player_client": [
+                    "web_safari",
+                    "web_creator",
+                    "tv_embedded",
+                    "ios",
+                    "android",
+                ],
+                "player_skip": ["webpage", "configs"],
+                "skip": ["hls", "dash"],
             }
         },
         "nocheckcertificate": True,
+        "geo_bypass": True,
     }
     with yt_dlp.YoutubeDL(opts) as y:
         y.download([url])
@@ -757,7 +767,6 @@ async def process_items(update, ctx, items, batch_label=""):
 
 async def start_batch(update, ctx, items, batch_label=""):
     user_id = update.effective_user.id
-
     if not is_owner(user_id):
         ok_p, _ = is_premium(user_id)
         if not ok_p:
@@ -765,11 +774,9 @@ async def start_batch(update, ctx, items, batch_label=""):
                 f"🚫 *Access Denied*\n\nAapki ID: `{user_id}`",
                 parse_mode="Markdown")
             return
-
     if user_id in CURRENT_TASK and not CURRENT_TASK[user_id].done():
         await update.message.reply_text("⚠️ Ek batch chal rahi. /stop bhejo.")
         return
-
     task = asyncio.create_task(process_items(update, ctx, items, batch_label))
     CURRENT_TASK[user_id] = task
     def _done(t):
@@ -1111,7 +1118,6 @@ async def handle_text(update, ctx):
 #  🎯 POST INIT — MENU SETUP
 # ═══════════════════════════════════════════════════════════
 async def post_init(app):
-    """Bot start hote hi command menu set karo."""
     general_commands = [
         BotCommand("start", "Bot info"),
         BotCommand("help", "Help"),
@@ -1121,7 +1127,6 @@ async def post_init(app):
         BotCommand("premium", "Check premium status"),
         BotCommand("myid", "Get your Telegram ID"),
     ]
-
     owner_commands = general_commands + [
         BotCommand("add", "Add premium (owner)"),
         BotCommand("remove", "Remove premium (owner)"),
@@ -1130,19 +1135,14 @@ async def post_init(app):
         BotCommand("getcookies", "Cookies status (owner)"),
         BotCommand("delcookies", "Delete cookies (owner)"),
     ]
-
-    # Default menu — sab users ke liye
     try:
-        await app.bot.set_my_commands(
-            general_commands, scope=BotCommandScopeDefault())
+        await app.bot.set_my_commands(general_commands, scope=BotCommandScopeDefault())
         print("✅ Default menu set")
     except Exception as e:
         print(f"⚠️ Default menu fail: {e}")
-
-    # Owner-only menu
     try:
-        await app.bot.set_my_commands(
-            owner_commands, scope=BotCommandScopeChat(chat_id=int(OWNER_ID)))
+        await app.bot.set_my_commands(owner_commands,
+            scope=BotCommandScopeChat(chat_id=int(OWNER_ID)))
         print("✅ Owner menu set")
     except Exception as e:
         print(f"⚠️ Owner menu fail: {e}")
@@ -1152,7 +1152,7 @@ def main():
     builder = (Application.builder()
                .token(BOT_TOKEN)
                .concurrent_updates(16)
-               .post_init(post_init))   # 🔥 MENU AUTO-SETUP
+               .post_init(post_init))
     if USE_LOCAL_API:
         builder = (builder.base_url(LOCAL_API_BASE)
                           .base_file_url(LOCAL_FILE_BASE)
@@ -1170,7 +1170,6 @@ def main():
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
-    # 🍪 Cookies commands
     app.add_handler(CommandHandler("setcookies", setcookies_cmd))
     app.add_handler(CommandHandler("getcookies", getcookies_cmd))
     app.add_handler(CommandHandler("delcookies", delcookies_cmd))
