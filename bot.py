@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════
 #  ⚙️  CONFIG
 # ═══════════════════════════════════════════════════════════
-BOT_TOKEN = "PASTE_NEW_TOKEN_HERE"
+BOT_TOKEN = "8933523621:AAE6IS2nIS5OaflvAEVyQK4mEXzj0V-boK4"
 API_ID    = "20346550"
 API_HASH  = "bc79c3bea7a626887bdc0871eecf0327"
 OWNER_ID  = 8460497291
