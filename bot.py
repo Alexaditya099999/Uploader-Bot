@@ -6,7 +6,6 @@ API_ID    = "20346550"
 API_HASH  = "bc79c3bea7a626887bdc0871eecf0327"
 OWNER_ID  = 8460497291
 
-# 🔥 MongoDB
 MONGO_URI = "mongodb+srv://alexaditya:alexaditya950@cluster0.7j1hfjk.mongodb.net/?appName=Cluster0"
 DB_NAME   = "course_uploader_bot"
 
@@ -33,27 +32,25 @@ from telegram.ext import (
 )
 
 # ═══════════════════════════════════════════════════════════
-#  🗄️ MONGODB CONNECTION
+#  🗄️ MONGODB
 # ═══════════════════════════════════════════════════════════
-users_col = captions_col = urls_col = settings_col = None
+users_col = captions_col = urls_col = settings_col = cookies_col = None
 MONGO_OK = False
 
 try:
     from pymongo import MongoClient
-    from pymongo.errors import PyMongoError
-
     _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
-    _client.server_info()  # test connection
+    _client.server_info()
     _db = _client[DB_NAME]
-    users_col    = _db["users"]      # {_id: "user_id", expires, added_by, added_at}
-    captions_col = _db["captions"]   # {_id: "user_id", enabled, template}
-    urls_col     = _db["urls"]       # {_id: "domain", added_by, added_at}
-    settings_col = _db["settings"]   # {_id: "url_mode", value: "open"|"locked"}
+    users_col    = _db["users"]
+    captions_col = _db["captions"]
+    urls_col     = _db["urls"]
+    settings_col = _db["settings"]
+    cookies_col  = _db["cookies"]
     MONGO_OK = True
     print("✅ MongoDB connected:", DB_NAME)
 except Exception as e:
     print(f"❌ MongoDB fail: {e}")
-    print("⚠️ Fallback: kuch bhi save nahi hoga!")
 
 # ═══════════════════════════════════════════════════════════
 #  🔧 LOCAL BOT API SERVER
@@ -65,8 +62,7 @@ os.makedirs(LOCAL_API_DIR, exist_ok=True)
 
 def auto_logout_public_api():
     try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/logOut", timeout=10)
+        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/logOut", timeout=10)
         if r.json().get("ok"):
             print("✅ Public API logout")
     except Exception as e:
@@ -84,9 +80,7 @@ def start_local_api_server():
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(6)
             try:
-                r = requests.get(
-                    f"http://localhost:{LOCAL_API_PORT}/bot{BOT_TOKEN}/getMe",
-                    timeout=5)
+                r = requests.get(f"http://localhost:{LOCAL_API_PORT}/bot{BOT_TOKEN}/getMe", timeout=5)
                 if r.status_code == 200:
                     print("✅ Local API ready — 4GB mode")
                     return True
@@ -108,6 +102,7 @@ DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 THUMB_DIR    = Path("thumbs")
 THUMB_DIR.mkdir(exist_ok=True)
+COOKIES_FILE = Path("cookies.txt")   # 🔥
 
 WAITING_TXT  = {}
 WAITING_CAPTION = {}
@@ -126,129 +121,147 @@ DEFAULT_CAPTION = (
 )
 
 # ═══════════════════════════════════════════════════════════
-#  🗄️ DATABASE HELPERS (MongoDB)
+#  🍪 COOKIES (MongoDB-backed)
 # ═══════════════════════════════════════════════════════════
-def is_premium(user_id) -> tuple:
+def save_cookies_to_db(content: bytes, filename: str = "cookies.txt") -> bool:
+    if not MONGO_OK: return False
+    try:
+        cookies_col.update_one(
+            {"_id": "primary"},
+            {"$set": {
+                "content": content,
+                "filename": filename,
+                "updated_at": datetime.utcnow(),
+                "size": len(content),
+            }},
+            upsert=True)
+        return True
+    except Exception as e:
+        print(f"⚠️ save cookies: {e}")
+        return False
+
+
+def load_cookies_from_db() -> dict:
+    if not MONGO_OK: return {}
+    try:
+        return cookies_col.find_one({"_id": "primary"}) or {}
+    except Exception:
+        return {}
+
+
+def delete_cookies_from_db() -> bool:
+    if not MONGO_OK: return False
+    try:
+        return cookies_col.delete_one({"_id": "primary"}).deleted_count > 0
+    except Exception:
+        return False
+
+
+def ensure_cookies_file() -> bool:
+    """MongoDB se cookies.txt local file me likho (yt-dlp ke liye)."""
+    data = load_cookies_from_db()
+    content = data.get("content")
+    if not content:
+        return False
+    try:
+        COOKIES_FILE.write_bytes(content)
+        return True
+    except Exception as e:
+        print(f"⚠️ write cookies: {e}")
+        return False
+
+
+# Startup pe cookies file bana lo
+if MONGO_OK:
+    if ensure_cookies_file():
+        print("✅ Cookies loaded from MongoDB")
+
+# ═══════════════════════════════════════════════════════════
+#  🗄️ DB HELPERS
+# ═══════════════════════════════════════════════════════════
+def is_premium(user_id):
     if not MONGO_OK: return False, 0
     try:
-        uid = str(user_id)
-        u = users_col.find_one({"_id": uid})
+        u = users_col.find_one({"_id": str(user_id)})
         if not u: return False, 0
         exp = u.get("expires")
         if not exp: return False, 0
         now = datetime.utcnow()
         if exp < now: return False, 0
         return True, (exp - now).days
-    except Exception as e:
-        print(f"⚠️ is_premium: {e}")
+    except Exception:
         return False, 0
 
 
-def add_premium(user_id, days: int, added_by: int) -> str:
+def add_premium(user_id, days, added_by):
     if not MONGO_OK: return "DB error"
     try:
-        uid = str(user_id)
-        now = datetime.utcnow()
+        uid = str(user_id); now = datetime.utcnow()
         u = users_col.find_one({"_id": uid})
-        if u and u.get("expires") and u["expires"] > now:
-            base = u["expires"]
-        else:
-            base = now
+        base = u["expires"] if (u and u.get("expires") and u["expires"] > now) else now
         new_exp = base + timedelta(days=days)
-        users_col.update_one(
-            {"_id": uid},
-            {"$set": {
-                "expires": new_exp,
-                "added_by": str(added_by),
-                "added_at": now,
-            }},
-            upsert=True
-        )
+        users_col.update_one({"_id": uid},
+            {"$set": {"expires": new_exp, "added_by": str(added_by), "added_at": now}},
+            upsert=True)
         return new_exp.strftime("%d %b %Y, %I:%M %p")
-    except Exception as e:
-        print(f"⚠️ add_premium: {e}")
+    except Exception:
         return "DB error"
 
 
-def remove_premium(user_id) -> bool:
+def remove_premium(user_id):
     if not MONGO_OK: return False
-    try:
-        r = users_col.delete_one({"_id": str(user_id)})
-        return r.deleted_count > 0
-    except Exception as e:
-        print(f"⚠️ remove_premium: {e}")
-        return False
+    try: return users_col.delete_one({"_id": str(user_id)}).deleted_count > 0
+    except Exception: return False
 
 
-def list_premium_users() -> list:
+def list_premium_users():
     if not MONGO_OK: return []
-    try:
-        return list(users_col.find({}))
-    except Exception as e:
-        print(f"⚠️ list_premium: {e}")
-        return []
+    try: return list(users_col.find({}))
+    except Exception: return []
 
 
-def is_owner(user_id) -> bool:
+def is_owner(user_id):
     return int(user_id) == int(OWNER_ID)
 
-# ───────── CAPTIONS ─────────
-def get_user_caption(uid) -> dict:
+
+def get_user_caption(uid):
     default = {"enabled": True, "template": DEFAULT_CAPTION}
     if not MONGO_OK: return default
     try:
         c = captions_col.find_one({"_id": str(uid)})
         if not c: return default
-        return {
-            "enabled": c.get("enabled", True),
-            "template": c.get("template", DEFAULT_CAPTION),
-        }
-    except Exception as e:
-        print(f"⚠️ get_caption: {e}")
+        return {"enabled": c.get("enabled", True),
+                "template": c.get("template", DEFAULT_CAPTION)}
+    except Exception:
         return default
 
 
-def set_caption_enabled(uid, enabled: bool):
+def set_caption_enabled(uid, enabled):
     if not MONGO_OK: return
-    try:
-        captions_col.update_one(
-            {"_id": str(uid)},
-            {"$set": {"enabled": enabled}},
-            upsert=True)
-    except Exception as e:
-        print(f"⚠️ set_caption_enabled: {e}")
+    try: captions_col.update_one({"_id": str(uid)}, {"$set": {"enabled": enabled}}, upsert=True)
+    except Exception: pass
 
 
-def set_caption_template(uid, template: str):
+def set_caption_template(uid, template):
     if not MONGO_OK: return
-    try:
-        captions_col.update_one(
-            {"_id": str(uid)},
-            {"$set": {"template": template}},
-            upsert=True)
-    except Exception as e:
-        print(f"⚠️ set_caption_template: {e}")
+    try: captions_col.update_one({"_id": str(uid)}, {"$set": {"template": template}}, upsert=True)
+    except Exception: pass
 
 
 def reset_caption(uid):
     if not MONGO_OK: return
-    try:
-        captions_col.update_one(
-            {"_id": str(uid)},
-            {"$set": {"template": DEFAULT_CAPTION}},
-            upsert=True)
-    except Exception as e:
-        print(f"⚠️ reset_caption: {e}")
+    try: captions_col.update_one({"_id": str(uid)}, {"$set": {"template": DEFAULT_CAPTION}}, upsert=True)
+    except Exception: pass
 
 
-def render_caption(template: str, values: dict) -> str:
+def render_caption(template, values):
     out = template
     for k, v in values.items():
         out = out.replace("{" + k + "}", str(v))
     return out
 
-# ───────── URL WHITELIST ─────────
-def get_url_mode() -> str:
+
+def get_url_mode():
     if not MONGO_OK: return "open"
     try:
         s = settings_col.find_one({"_id": "url_mode"})
@@ -257,41 +270,31 @@ def get_url_mode() -> str:
         return "open"
 
 
-def set_url_mode(mode: str) -> dict:
+def set_url_mode(mode):
     mode = mode.lower().strip()
     if mode not in ("open", "locked"):
         return {"ok": False, "msg": "Mode sirf: open ya locked"}
     if not MONGO_OK:
         return {"ok": False, "msg": "❌ DB not available"}
     try:
-        settings_col.update_one(
-            {"_id": "url_mode"},
-            {"$set": {"value": mode}},
-            upsert=True)
+        settings_col.update_one({"_id": "url_mode"}, {"$set": {"value": mode}}, upsert=True)
         return {"ok": True, "msg": f"✅ Mode set: {mode}"}
     except Exception as e:
         return {"ok": False, "msg": f"❌ {e}"}
 
 
-def get_domain(url: str) -> str:
-    try:
-        p = urlparse(url)
-        return (p.netloc or "").lower()
-    except Exception:
-        return ""
+def get_domain(url):
+    try: return (urlparse(url).netloc or "").lower()
+    except Exception: return ""
 
 
-def is_url_allowed(url: str) -> tuple:
+def is_url_allowed(url):
     mode = get_url_mode()
-    if mode == "open":
-        return True, "open mode"
+    if mode == "open": return True, "open mode"
     domain = get_domain(url)
-    if not domain:
-        return False, "invalid URL"
-    if not MONGO_OK:
-        return False, "DB offline"
+    if not domain: return False, "invalid URL"
+    if not MONGO_OK: return False, "DB offline"
     try:
-        # Exact match ya subdomain match
         candidates = [domain]
         parts = domain.split(".")
         for i in range(1, len(parts)):
@@ -299,43 +302,34 @@ def is_url_allowed(url: str) -> tuple:
         for c in candidates:
             if urls_col.find_one({"_id": c}):
                 return True, f"matched: {c}"
-        return False, f"domain not in whitelist: {domain}"
+        return False, f"not in whitelist: {domain}"
     except Exception as e:
         return False, f"DB error: {e}"
 
 
-def add_url_pattern(url: str, added_by: int) -> dict:
+def add_url_pattern(url, added_by):
     domain = get_domain(url)
-    if not domain:
-        return {"ok": False, "msg": "Invalid URL — domain nahi mila"}
-    if not MONGO_OK:
-        return {"ok": False, "msg": "❌ DB not available"}
+    if not domain: return {"ok": False, "msg": "Invalid URL"}
+    if not MONGO_OK: return {"ok": False, "msg": "❌ DB not available"}
     try:
         if urls_col.find_one({"_id": domain}):
             return {"ok": False, "msg": f"⚠️ Already exists: {domain}"}
-        urls_col.insert_one({
-            "_id": domain,
-            "added_by": str(added_by),
-            "added_at": datetime.utcnow(),
-        })
+        urls_col.insert_one({"_id": domain, "added_by": str(added_by), "added_at": datetime.utcnow()})
         return {"ok": True, "msg": f"✅ Domain added: `{domain}`"}
     except Exception as e:
         return {"ok": False, "msg": f"❌ {e}"}
 
 
-def remove_url_pattern(token: str) -> dict:
-    if not MONGO_OK:
-        return {"ok": False, "msg": "❌ DB not available"}
+def remove_url_pattern(token):
+    if not MONGO_OK: return {"ok": False, "msg": "❌ DB not available"}
     try:
         domains = [d["_id"] for d in urls_col.find({}, {"_id": 1})]
-        # Index try
         if token.isdigit():
             idx = int(token) - 1
             if 0 <= idx < len(domains):
                 removed = domains[idx]
                 urls_col.delete_one({"_id": removed})
                 return {"ok": True, "msg": f"✅ Removed: `{removed}`"}
-        # Domain try
         d = get_domain(token) or token.lower().strip()
         if urls_col.delete_one({"_id": d}).deleted_count:
             return {"ok": True, "msg": f"✅ Removed: `{d}`"}
@@ -344,12 +338,10 @@ def remove_url_pattern(token: str) -> dict:
         return {"ok": False, "msg": f"❌ {e}"}
 
 
-def list_domains() -> list:
+def list_domains():
     if not MONGO_OK: return []
-    try:
-        return list(urls_col.find({}).sort("added_at", -1))
-    except Exception:
-        return []
+    try: return list(urls_col.find({}).sort("added_at", -1))
+    except Exception: return []
 
 # ═══════════════════════════════════════════════════════════
 #  🎯 URL HANDLING
@@ -394,8 +386,7 @@ def find_working_url(video_id, course_id, token, userid, user_id=None):
 
 
 def resolve_url(url, user_id=None):
-    if is_direct_media_url(url):
-        return url
+    if is_direct_media_url(url): return url
     if is_api_url(url):
         p = urlparse(url); qs = parse_qs(p.query)
         video_id  = qs.get("video_id",  [""])[0]
@@ -409,61 +400,44 @@ def resolve_url(url, user_id=None):
 # ═══════════════════════════════════════════════════════════
 #  🖼️ THUMBNAIL + DURATION
 # ═══════════════════════════════════════════════════════════
-def generate_thumbnail(video_path: Path, out_path: Path, seek_sec: int = 5) -> bool:
+def generate_thumbnail(video_path, out_path, seek_sec=5):
     try:
-        subprocess.run([
-            "ffmpeg", "-y", "-ss", str(seek_sec), "-i", str(video_path),
-            "-vframes", "1", "-vf", "scale=320:-1", "-q:v", "5",
-            str(out_path)
-        ], capture_output=True, timeout=30)
-        if out_path.exists() and out_path.stat().st_size > 0:
-            return True
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(video_path),
-            "-vframes", "1", "-vf", "scale=320:-1", "-q:v", "5",
-            str(out_path)
-        ], capture_output=True, timeout=30)
+        subprocess.run(["ffmpeg", "-y", "-ss", str(seek_sec), "-i", str(video_path),
+                        "-vframes", "1", "-vf", "scale=320:-1", "-q:v", "5",
+                        str(out_path)], capture_output=True, timeout=30)
+        if out_path.exists() and out_path.stat().st_size > 0: return True
+        subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-vframes", "1",
+                        "-vf", "scale=320:-1", "-q:v", "5", str(out_path)],
+                       capture_output=True, timeout=30)
         return out_path.exists() and out_path.stat().st_size > 0
-    except Exception as e:
-        print(f"⚠️ Thumb fail: {e}")
+    except Exception:
         return False
 
 
-def get_media_info(path) -> dict:
+def get_media_info(path):
     info = {"duration": 0.0, "width": 0, "height": 0}
     try:
-        r = subprocess.run([
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path)
-        ], capture_output=True, timeout=20, text=True)
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                           capture_output=True, timeout=20, text=True)
         try: info["duration"] = float(r.stdout.strip())
         except Exception: pass
         if info["duration"] <= 0:
-            r = subprocess.run([
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(path)
-            ], capture_output=True, timeout=20, text=True)
+            r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                "-show_entries", "stream=duration",
+                                "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                               capture_output=True, timeout=20, text=True)
             try: info["duration"] = float(r.stdout.strip())
             except Exception: pass
-        r = subprocess.run([
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=s=x:p=0",
-            str(path)
-        ], capture_output=True, timeout=20, text=True)
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height",
+                            "-of", "csv=s=x:p=0", str(path)],
+                           capture_output=True, timeout=20, text=True)
         out = r.stdout.strip()
         if "x" in out:
-            parts = out.split("x")
-            info["width"] = int(parts[0])
-            info["height"] = int(parts[1])
-    except Exception as e:
-        print(f"⚠️ ffprobe fail: {e}")
+            p = out.split("x"); info["width"] = int(p[0]); info["height"] = int(p[1])
+    except Exception:
+        pass
     return info
 
 # ───────── HELPERS ─────────
@@ -482,13 +456,11 @@ def fmt_size_mib(b):
     return f"{mib / 1024:.2f} GiB"
 
 
-def fmt_speed_mib(bps):
-    return fmt_size_mib(bps) + "/s"
+def fmt_speed_mib(bps): return fmt_size_mib(bps) + "/s"
 
 
 def fmt_eta_fancy(secs):
-    if secs is None or secs < 0 or secs == float("inf"):
-        return "Calculating..."
+    if secs is None or secs < 0 or secs == float("inf"): return "Calculating..."
     secs = int(secs)
     if secs < 60: return f"{secs}s"
     m, s = divmod(secs, 60)
@@ -500,15 +472,13 @@ def fmt_eta_fancy(secs):
 def fmt_duration(secs):
     if not secs or secs <= 0: return "0:00"
     secs = int(secs)
-    h, rem = divmod(secs, 3600)
-    m, s = divmod(rem, 60)
+    h, rem = divmod(secs, 3600); m, s = divmod(rem, 60)
     if h: return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
 
 
 def make_bar(pct, width=20):
-    filled = int(width * pct / 100)
-    filled = max(0, min(width, filled))
+    filled = int(width * pct / 100); filled = max(0, min(width, filled))
     return "▓" * filled + "░" * (width - filled)
 
 
@@ -519,37 +489,27 @@ def build_fancy_progress(phase, done, total, speed, header=""):
     lines = []
     if header:
         lines.append(header); lines.append("")
-    lines.append(f"┌─「 {phase} 」─○")
-    lines.append("│")
-    lines.append(f"│ » Progress:- {pct:.2f}%")
-    lines.append("│")
-    lines.append(f"│ » {bar}")
-    lines.append("│")
-    lines.append(f"│ » «{fmt_size_mib(done)} of {fmt_size_mib(total)}»")
-    lines.append("│")
-    lines.append(f"│ » Speed:- {fmt_speed_mib(speed)}")
-    lines.append("│")
-    lines.append(f"│ » ETA:- {eta}")
-    lines.append("│")
+    lines.append(f"┌─「 {phase} 」─○"); lines.append("│")
+    lines.append(f"│ » Progress:- {pct:.2f}%"); lines.append("│")
+    lines.append(f"│ » {bar}"); lines.append("│")
+    lines.append(f"│ » «{fmt_size_mib(done)} of {fmt_size_mib(total)}»"); lines.append("│")
+    lines.append(f"│ » Speed:- {fmt_speed_mib(speed)}"); lines.append("│")
+    lines.append(f"│ » ETA:- {eta}"); lines.append("│")
     lines.append("└────────────────────○")
     return "\n".join(lines)
 
 
 async def safe_edit(bot, chat_id, msg_id, text, keyboard=None):
     try:
-        await bot.edit_message_text(
-            chat_id=chat_id, message_id=msg_id, text=text[:4000],
-            reply_markup=keyboard)
+        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
+                                    text=text[:4000], reply_markup=keyboard)
     except Exception:
         pass
 
 
-def is_stopped(user_id):
-    return STOP_FLAGS.get(user_id, False)
+def is_stopped(user_id): return STOP_FLAGS.get(user_id, False)
 
-# ═══════════════════════════════════════════════════════════
-#  📄 TXT PARSER
-# ═══════════════════════════════════════════════════════════
+# ───────── TXT PARSER ─────────
 URL_RE   = re.compile(r"(https?://\S+)")
 TYPE_RE  = re.compile(r"\[(VIDEO|PDF)\]", re.I)
 SHORT_RE = re.compile(
@@ -557,15 +517,14 @@ SHORT_RE = re.compile(
     r"\s*(?:[\|,]\s*(?P<uid>\d+))?\s*$")
 
 
-def url_basename(url: str) -> str:
+def url_basename(url):
     clean = url.split("?")[0].split("#")[0]
     name = unquote(clean.rstrip("/").split("/")[-1])
     return name or "file"
 
 
 def parse_txt(text):
-    items = []
-    pending_name = None
+    items = []; pending_name = None
     for raw in text.splitlines():
         line = raw.strip()
         if not line: continue
@@ -576,27 +535,22 @@ def parse_txt(text):
             tm = TYPE_RE.search(before)
             ftype = tm.group(1).upper() if tm else "VIDEO"
             name_part = TYPE_RE.sub("", before).strip()
-            name = name_part if name_part else (
-                pending_name if pending_name else url_basename(url))
+            name = name_part if name_part else (pending_name if pending_name else url_basename(url))
             name = name.rstrip(":").strip() or url_basename(url)
-            items.append({"group": "", "type": ftype, "name": name,
-                          "url": url, "mode": "url"})
-            pending_name = None
-            continue
+            items.append({"group": "", "type": ftype, "name": name, "url": url, "mode": "url"})
+            pending_name = None; continue
         sm = SHORT_RE.match(line)
         if sm:
             items.append({"group": "", "type": "VIDEO",
                           "name": f"Video {sm.group('vid')}",
-                          "video_id": sm.group("vid"),
-                          "token": sm.group("tok"),
+                          "video_id": sm.group("vid"), "token": sm.group("tok"),
                           "userid": sm.group("uid"), "mode": "short"})
-            pending_name = None
-            continue
+            pending_name = None; continue
         pending_name = line.rstrip(":").strip()
     return items
 
 # ═══════════════════════════════════════════════════════════
-#  📥 DOWNLOAD
+#  📥 DOWNLOAD — yt-dlp (cookies) → HTTP fallback
 # ═══════════════════════════════════════════════════════════
 def download_file(url, out_dir, base, info, user_id=None):
     def hook(d):
@@ -614,90 +568,116 @@ def download_file(url, out_dir, base, info, user_id=None):
             if user_id and is_stopped(user_id):
                 raise yt_dlp.utils.DownloadError("User stopped")
 
+    # 🔥 Cookies ensure — MongoDB se file banao
+    ensure_cookies_file()
+    has_cookies = COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0
+    if has_cookies:
+        print(f"🍪 Using cookies ({COOKIES_FILE.stat().st_size} bytes)")
+    else:
+        print("⚠️ Cookies nahi — YouTube/IG fail honge")
+
     browser_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
         "Referer": f"https://{urlparse(url).netloc}/",
     }
 
-    ext_check = url.lower().split("?")[0]
-    generic_exts = (".apk", ".zip", ".rar", ".pdf", ".exe", ".apks", ".xapk")
-    if any(ext_check.endswith(e) for e in generic_exts):
-        print(f"📥 Direct download: {url[:80]}")
-        try:
-            with requests.get(url, headers=browser_headers, stream=True,
-                              timeout=120, allow_redirects=True) as r:
-                if r.status_code >= 400:
-                    raise ValueError(f"HTTP {r.status_code}")
-                total = int(r.headers.get("Content-Length", 0))
-                info["total"] = total
-                ext = os.path.splitext(url.split("?")[0])[1] or ".bin"
-                out_path = out_dir / f"{base}{ext}"
-                if out_path.name.count(".") > 1:
-                    parts = out_path.name.split(".")
-                    if parts[-1] == parts[-2]:
-                        out_path = out_dir / f"{base}.{parts[-1]}"
-                with open(out_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 256):
-                        if chunk:
-                            f.write(chunk)
-                            info["done"] += len(chunk)
-                            t = time.time()
-                            if info.get("_t"):
-                                dt = t - info["_t"]
-                                if dt >= 0.5:
-                                    info["speed"] = (info["done"] - info["_b"]) / dt
-                                    info["_t"], info["_b"] = t, info["done"]
-                            else:
-                                info["_t"], info["_b"] = t, info["done"]
-                            if user_id and is_stopped(user_id):
-                                f.close(); os.remove(out_path)
-                                raise yt_dlp.utils.DownloadError("User stopped")
-                return out_path
-        except Exception as e:
-            print(f"⚠️ Direct fail: {e}, yt-dlp try...")
+    # ─── STEP 1: yt-dlp ───
+    try:
+        opts = {
+            "outtmpl": str(out_dir / f"{base}.%(ext)s"),
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "quiet": True, "no_warnings": True, "noplaylist": True,
+            "progress_hooks": [hook],
+            "retries": 5, "fragment_retries": 5,
+            "socket_timeout": 30,
+            "http_headers": browser_headers,
+            # 🔥 Cookies
+            "cookiefile": str(COOKIES_FILE) if has_cookies else None,
+            # 🔥 YouTube bypass
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["web", "android", "ios", "tv_embedded"],
+                }
+            },
+            "nocheckcertificate": True,
+            "prefer_insecure": False,
+        }
+        with yt_dlp.YoutubeDL(opts) as y:
+            y.download([url])
 
-    opts = {
-        "outtmpl": str(out_dir / f"{base}.%(ext)s"),
-        "format": "best[ext=mp4]/best",
-        "quiet": True, "no_warnings": True, "noplaylist": True,
-        "progress_hooks": [hook],
-        "retries": 10, "fragment_retries": 10,
-        "socket_timeout": 30,
-        "http_headers": browser_headers,
-    }
-    with yt_dlp.YoutubeDL(opts) as y:
-        y.download([url])
+        files = [f for f in out_dir.glob(f"{base}.*") if f.is_file()]
+        if files:
+            f = files[0]
+            if f.stat().st_size >= 10 * 1024:
+                ext = f.suffix.lower()
+                if ext not in MEDIA_EXTS and ext != "":
+                    try:
+                        head = f.read_bytes()[:16]
+                        if head[4:8] == b"ftyp":
+                            new = f.with_suffix(".mp4"); f.rename(new); f = new
+                        elif head[:4] == b"%PDF":
+                            new = f.with_suffix(".pdf"); f.rename(new); f = new
+                    except Exception: pass
+                return f
+            else:
+                try: f.unlink()
+                except: pass
+    except Exception as e:
+        print(f"⚠️ yt-dlp fail: {str(e)[:120]} → HTTP fallback")
 
-    files = [f for f in out_dir.glob(f"{base}.*") if f.is_file()]
-    if not files:
-        raise FileNotFoundError("Downloaded file missing")
-    f = files[0]
-    size = f.stat().st_size
-    if size < 10 * 1024:
-        try:
-            head = f.read_bytes()[:200].lower()
-            if b"<html" in head or b"<!doctype" in head:
-                f.unlink()
-                raise ValueError("HTML page download hua — real file nahi")
-        except Exception: pass
-        f.unlink()
-        raise ValueError(f"File bahut chhota ({size} bytes)")
+    # ─── STEP 2: HTTP direct (HTML, images, generic files) ───
+    print(f"📥 HTTP download: {url[:80]}")
+    with requests.get(url, headers=browser_headers, stream=True,
+                      timeout=120, allow_redirects=True) as r:
+        if r.status_code >= 400:
+            raise ValueError(f"HTTP {r.status_code}")
+        ctype = r.headers.get("Content-Type", "").lower()
+        clen = r.headers.get("Content-Length", "0")
+        try: total = int(clen)
+        except: total = 0
+        info["total"] = total
 
-    ext = f.suffix.lower()
-    if ext not in MEDIA_EXTS and ext != "":
-        try:
-            head = f.read_bytes()[:16]
-            if head[4:8] == b"ftyp":
-                new = f.with_suffix(".mp4"); f.rename(new); f = new
-            elif head[:4] == b"%PDF":
-                new = f.with_suffix(".pdf"); f.rename(new); f = new
-        except Exception: pass
-    return f
+        url_path = url.split("?")[0].rstrip("/")
+        url_ext = os.path.splitext(url_path)[1].lower()
+        if url_ext and len(url_ext) <= 6 and url_ext not in (".php", ".asp", ".aspx"):
+            ext = url_ext
+        elif "text/html" in ctype: ext = ".html"
+        elif "application/pdf" in ctype: ext = ".pdf"
+        elif "application/json" in ctype: ext = ".json"
+        elif "image/png" in ctype: ext = ".png"
+        elif "image/jpeg" in ctype: ext = ".jpg"
+        elif "text/plain" in ctype: ext = ".txt"
+        elif "application/zip" in ctype: ext = ".zip"
+        else: ext = ".bin"
+
+        out_path = out_dir / f"{base}{ext}"
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+                    info["done"] += len(chunk)
+                    t = time.time()
+                    if info.get("_t"):
+                        dt = t - info["_t"]
+                        if dt >= 0.5:
+                            info["speed"] = (info["done"] - info["_b"]) / dt
+                            info["_t"], info["_b"] = t, info["done"]
+                    else:
+                        info["_t"], info["_b"] = t, info["done"]
+                    if user_id and is_stopped(user_id):
+                        f.close()
+                        try: os.remove(out_path)
+                        except: pass
+                        raise yt_dlp.utils.DownloadError("User stopped")
+
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise ValueError("Download failed — empty file")
+    return out_path
 
 # ───────── UPLOAD PROGRESS ─────────
 class ProgressFile:
@@ -734,8 +714,7 @@ async def process_items(update, ctx, items, batch_label=""):
 
     u = update.effective_user
     downloaded_by = u.first_name or u.username or str(user_id)
-    if u.last_name:
-        downloaded_by += f" {u.last_name}"
+    if u.last_name: downloaded_by += f" {u.last_name}"
 
     STOP_FLAGS[user_id] = False
     cancel_kb = InlineKeyboardMarkup([
@@ -749,30 +728,23 @@ async def process_items(update, ctx, items, batch_label=""):
         f"Batch: {batch_label or 'Direct'}\n"
         f"Total: {total} item(s)\n\n"
         f"`/stop` ya button se rok sakte ho.",
-        parse_mode="Markdown",
-        reply_markup=cancel_kb,
-    )
+        parse_mode="Markdown", reply_markup=cancel_kb)
 
-    ok = 0
-    failed = []
-    stopped = False
+    ok = 0; failed = []; stopped = False
 
     for idx, item in enumerate(items, 1):
         if is_stopped(user_id):
             stopped = True; break
         name = item["name"][:100]
         ftype = item["type"]
-        group = item["group"][:80]
-        header = (f"📦 Item {idx}/{total}\n"
-                  f"📁 {group}\n🎬 {name}\n🔖 {ftype}")
+        header = f"📦 Item {idx}/{total}\n🎬 {name}\n🔖 {ftype}"
 
         await safe_edit(ctx.bot, chat_id, status.message_id,
                         f"{header}\n\n🔐 Step 1/3 — Verifying...", cancel_kb)
         if is_stopped(user_id):
             stopped = True; break
         try:
-            final_url = await loop.run_in_executor(
-                None, resolve_url, item["url"], user_id)
+            final_url = await loop.run_in_executor(None, resolve_url, item["url"], user_id)
         except PermissionError as e:
             failed.append((idx, name, "verify", f"auth: {str(e)[:120]}")); continue
         except Exception as e:
@@ -782,15 +754,15 @@ async def process_items(update, ctx, items, batch_label=""):
 
         base = f"{user_id}_{idx}"
         dl_info = {"done": 0, "total": 0, "speed": 0}
-        dl_task = loop.run_in_executor(
-            None, download_file, final_url, DOWNLOAD_DIR, base, dl_info, user_id)
+        dl_task = loop.run_in_executor(None, download_file, final_url,
+                                       DOWNLOAD_DIR, base, dl_info, user_id)
 
         while not dl_task.done():
             await asyncio.wait({dl_task}, timeout=3)
             if is_stopped(user_id):
                 stopped = True; break
-            txt = build_fancy_progress("Downloading",
-                dl_info["done"], dl_info["total"], dl_info["speed"], header)
+            txt = build_fancy_progress("Downloading", dl_info["done"],
+                                       dl_info["total"], dl_info["speed"], header)
             await safe_edit(ctx.bot, chat_id, status.message_id, txt, cancel_kb)
 
         if stopped:
@@ -810,8 +782,7 @@ async def process_items(update, ctx, items, batch_label=""):
 
         size_mb = os.path.getsize(out_path) / (1024 * 1024)
         if size_mb > MAX_UPLOAD_MB:
-            failed.append((idx, name, "download",
-                           f"{size_mb:.0f}MB > {MAX_UPLOAD_MB}MB"))
+            failed.append((idx, name, "download", f"{size_mb:.0f}MB > {MAX_UPLOAD_MB}MB"))
             try: os.remove(out_path)
             except: pass
             continue
@@ -822,12 +793,11 @@ async def process_items(update, ctx, items, batch_label=""):
 
         thumb_path = None
         media_info = {"duration": 0.0, "width": 0, "height": 0}
-        is_video = out_path.suffix.lower() not in (".pdf", ".mp3", ".m4a",
-                                                   ".zip", ".rar", ".apk")
+        is_video = out_path.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov",
+                                               ".m4v", ".avi", ".flv", ".ts")
         if is_video:
             t_path = THUMB_DIR / f"{base}.jpg"
-            ok_thumb = await loop.run_in_executor(
-                None, generate_thumbnail, out_path, t_path)
+            ok_thumb = await loop.run_in_executor(None, generate_thumbnail, out_path, t_path)
             if ok_thumb: thumb_path = t_path
             media_info = await loop.run_in_executor(None, get_media_info, out_path)
 
@@ -836,7 +806,7 @@ async def process_items(update, ctx, items, batch_label=""):
         name_clean = name
         if name_clean.lower().endswith(f".{ext.lower()}"):
             name_clean = name_clean[:-(len(ext) + 1)]
-        display_name = f"{name_clean[:60]}.{ext}" if ext else f"{name_clean[:60]}.mp4"
+        display_name = f"{name_clean[:60]}.{ext}" if ext else f"{name_clean[:60]}"
 
         if cap["enabled"]:
             values = {
@@ -844,8 +814,7 @@ async def process_items(update, ctx, items, batch_label=""):
                 "file_size": fmt_size(os.path.getsize(out_path)),
                 "file_extension": ext or "file",
                 "file_duration": fmt_duration(media_info["duration"]),
-                "file_url": item["url"],
-                "file_index": idx,
+                "file_url": item["url"], "file_index": idx,
                 "batch_name": batch_label or "Direct",
                 "downloaded_by": downloaded_by,
             }
@@ -857,26 +826,19 @@ async def process_items(update, ctx, items, batch_label=""):
         wrapper = ProgressFile(str(out_path), up_info)
         thumb_fh = open(thumb_path, "rb") if thumb_path else None
         try:
-            if ext == "pdf" or ftype == "PDF":
-                coro = ctx.bot.send_document(
-                    chat_id=chat_id, document=wrapper,
-                    filename=display_name, caption=caption,
-                    thumbnail=thumb_fh,
-                    read_timeout=7200, write_timeout=7200)
-            elif ext in ("apk", "zip", "rar"):
-                coro = ctx.bot.send_document(
-                    chat_id=chat_id, document=wrapper,
-                    filename=display_name, caption=caption,
-                    read_timeout=7200, write_timeout=7200)
-            else:
+            if is_video:
                 coro = ctx.bot.send_video(
-                    chat_id=chat_id, video=wrapper,
-                    filename=display_name, caption=caption,
-                    thumbnail=thumb_fh,
+                    chat_id=chat_id, video=wrapper, filename=display_name,
+                    caption=caption, thumbnail=thumb_fh,
                     duration=int(media_info["duration"]) if media_info["duration"] else 0,
                     width=media_info["width"] or None,
                     height=media_info["height"] or None,
                     supports_streaming=True,
+                    read_timeout=7200, write_timeout=7200)
+            else:
+                coro = ctx.bot.send_document(
+                    chat_id=chat_id, document=wrapper, filename=display_name,
+                    caption=caption, thumbnail=thumb_fh,
                     read_timeout=7200, write_timeout=7200)
         except Exception as e:
             wrapper.close()
@@ -890,15 +852,14 @@ async def process_items(update, ctx, items, batch_label=""):
             await asyncio.wait({send_task}, timeout=3)
             if is_stopped(user_id):
                 send_task.cancel(); stopped = True; break
-            txt = build_fancy_progress("Uploading",
-                up_info["done"], up_info["total"], up_info["speed"], header)
+            txt = build_fancy_progress("Uploading", up_info["done"],
+                                       up_info["total"], up_info["speed"], header)
             await safe_edit(ctx.bot, chat_id, status.message_id, txt, cancel_kb)
 
         try:
             if not stopped:
                 await send_task; ok += 1
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError: pass
         except Exception as e:
             failed.append((idx, name, "upload", str(e)[:120]))
         finally:
@@ -913,12 +874,9 @@ async def process_items(update, ctx, items, batch_label=""):
         if stopped: break
 
     if stopped:
-        final = (f"🛑 *STOPPED*\n\n"
-                 f"✔️ Uploaded: {ok}/{total}\n"
-                 f"❌ Failed: {len(failed)}")
+        final = f"🛑 *STOPPED*\n\n✔️ Uploaded: {ok}/{total}\n❌ Failed: {len(failed)}"
     else:
-        final = (f"✅ *DONE ({mode})*\n\n"
-                 f"✔️ Uploaded: {ok}/{total}\n"
+        final = (f"✅ *DONE ({mode})*\n\n✔️ Uploaded: {ok}/{total}\n"
                  f"❌ Failed: {len(failed)}/{total}")
     if failed:
         final += "\n\n*Failed Items:*\n"
@@ -932,363 +890,135 @@ async def process_items(update, ctx, items, batch_label=""):
 
 async def start_batch(update, ctx, items, batch_label=""):
     user_id = update.effective_user.id
-
     if not is_owner(user_id):
-        ok_p, days = is_premium(user_id)
+        ok_p, _ = is_premium(user_id)
         if not ok_p:
             await update.message.reply_text(
-                f"🚫 *Access Denied*\n\n"
-                f"Aapki ID: `{user_id}`\n"
-                f"Owner se contact karo.",
-                parse_mode="Markdown")
+                f"🚫 *Access Denied*\n\nAapki ID: `{user_id}`", parse_mode="Markdown")
             return
 
-    # URL whitelist check (owner exempt)
     if not is_owner(user_id):
         blocked = []
         for it in items:
             u = it.get("url", "")
             if u:
                 allowed, reason = is_url_allowed(u)
-                if not allowed:
-                    blocked.append((it.get("name", "?"), u, reason))
+                if not allowed: blocked.append((it.get("name", "?"), reason))
         if blocked:
             mode = get_url_mode()
-            msg = (f"🚫 *URL Not Allowed*\n\n"
-                   f"Mode: `{mode}`\n"
-                   f"Blocked: {len(blocked)}/{len(items)}\n\n")
-            for n, u, r in blocked[:5]:
-                msg += f"• `{n[:30]}`\n  {r[:80]}\n"
-            if len(blocked) > 5:
-                msg += f"\n_...aur {len(blocked)-5}_\n"
-            msg += "\nOwner se request karo is domain ko approve karne ke liye."
+            msg = f"🚫 *URL Not Allowed*\n\nMode: `{mode}`\nBlocked: {len(blocked)}/{len(items)}\n\n"
+            for n, r in blocked[:5]: msg += f"• `{n[:30]}` → {r[:80]}\n"
+            msg += "\nOwner se request karo."
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
 
     if user_id in CURRENT_TASK and not CURRENT_TASK[user_id].done():
-        await update.message.reply_text(
-            "⚠️ Aapki ek batch chal rahi hai. /stop bhejo pehle.")
+        await update.message.reply_text("⚠️ Ek batch chal rahi. /stop bhejo.")
         return
 
     task = asyncio.create_task(process_items(update, ctx, items, batch_label))
     CURRENT_TASK[user_id] = task
-
     def _done(t):
-        if CURRENT_TASK.get(user_id) is t:
-            CURRENT_TASK.pop(user_id, None)
+        if CURRENT_TASK.get(user_id) is t: CURRENT_TASK.pop(user_id, None)
         STOP_FLAGS.pop(user_id, None)
     task.add_done_callback(_done)
 
 # ═══════════════════════════════════════════════════════════
-#  🔐 URL WHITELIST COMMANDS (Owner)
+#  🍪 COOKIES COMMANDS
 # ═══════════════════════════════════════════════════════════
-async def addurl_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def setcookies_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("🚫 Sirf owner."); return
-    if not ctx.args:
-        await update.message.reply_text(
-            "Usage: `/addurl <url>`\n"
-            "Example: `/addurl https://example.com/video/123.mp4`\n"
-            "Bot domain save karega: `example.com`",
-            parse_mode="Markdown"); return
-    url = ctx.args[0].strip()
-    if not url.startswith("http"):
-        url = "https://" + url
-    res = add_url_pattern(url, update.effective_user.id)
-    await update.message.reply_text(res["msg"], parse_mode="Markdown")
 
-
-async def delurl_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Sirf owner."); return
-    if not ctx.args:
-        await update.message.reply_text("Usage: `/delurl <domain|index>`",
-                                        parse_mode="Markdown"); return
-    res = remove_url_pattern(ctx.args[0].strip())
-    await update.message.reply_text(res["msg"], parse_mode="Markdown")
-
-
-async def listurl_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Sirf owner."); return
-    mode = get_url_mode()
-    domains = list_domains()
-    msg = (f"🌐 *URL Whitelist*\n\n"
-           f"Mode: `{mode}`\n"
-           f"Total: {len(domains)}\n\n")
-    if domains:
-        for i, d in enumerate(domains, 1):
-            added = d.get("added_at")
-            added_s = added.strftime("%d %b %Y") if added else "?"
-            msg += f"{i}. `{d['_id']}` _(added {added_s})_\n"
-    else:
-        msg += "_Koi domain nahi_\n"
-    msg += "\n*Commands:*\n"
-    msg += "• `/addurl <url>`\n"
-    msg += "• `/delurl <index|domain>`\n"
-    msg += "• `/urlmode open|locked`\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-async def urlmode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Sirf owner."); return
-    if not ctx.args:
-        mode = get_url_mode()
-        await update.message.reply_text(
-            f"Current mode: `{mode}`\n\n"
-            f"Change: `/urlmode open` ya `/urlmode locked`",
-            parse_mode="Markdown"); return
-    res = set_url_mode(ctx.args[0])
-    await update.message.reply_text(res["msg"])
-
-# ═══════════════════════════════════════════════════════════
-#  🎨 CAPTION COMMAND
-# ═══════════════════════════════════════════════════════════
-def build_caption_menu(uid) -> str:
-    cap = get_user_caption(uid)
-    status = "Enabled" if cap["enabled"] else "Disabled"
-    return (
-        "Set Caption\n\n"
-        "➤ Available Variables 📌\n\n"
-        "🎙 Name : {file_name}\n"
-        "📦 Size : {file_size}\n"
-        "⚙️ Extension : {file_extension}\n"
-        "⏱ Duration : {file_duration}\n"
-        "🔗 Link : {file_url}\n"
-        "🔢 Index : {file_index}\n"
-        "📚 Batch Name : {batch_name}\n"
-        "👤 Downloaded By : {downloaded_by}\n\n"
-        "═══════════════════════\n\n"
-        "➤ Current:\n"
-        f"{cap['template']}\n\n"
-        "═══════════════════════\n\n"
-        "➤ Default:\n"
-        f"{DEFAULT_CAPTION}\n\n"
-        f"➤ Status: {status}"
-    )
-
-
-def caption_keyboard(uid):
-    cap = get_user_caption(uid)
-    toggle_text = "🔴 DISABLE" if cap["enabled"] else "🟢 ENABLE"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(toggle_text, callback_data="cap:toggle")],
-        [InlineKeyboardButton("✏️ UPDATE CAPTION", callback_data="cap:update")],
-        [InlineKeyboardButton("↺ RESET DEFAULT", callback_data="cap:reset")],
-        [InlineKeyboardButton("🔙 BACK", callback_data="cap:back")],
-    ])
-
-
-async def caption_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        ok_p, _ = is_premium(uid)
-        if not ok_p:
-            await update.message.reply_text(
-                f"🚫 Premium chahiye. Aapki ID: `{uid}`",
-                parse_mode="Markdown")
-            return
-    await update.message.reply_text(
-        build_caption_menu(uid),
-        reply_markup=caption_keyboard(uid))
-
-
-async def caption_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    action = q.data.split(":", 1)[1]
-    if action == "toggle":
-        cap = get_user_caption(uid)
-        set_caption_enabled(uid, not cap["enabled"])
-        await q.answer("✅ Toggled!")
-        await q.edit_message_text(build_caption_menu(uid),
-                                  reply_markup=caption_keyboard(uid))
-    elif action == "update":
-        WAITING_CAPTION[uid] = True
-        await q.answer("Send new template")
-        await q.edit_message_text(
-            "✏️ *Caption Template Update*\n\n"
-            "Naya template bhejo (text message).\n\n"
-            "Variables: `{file_name}` `{file_size}` `{file_extension}` "
-            "`{file_duration}` `{file_url}` `{file_index}` `{batch_name}` "
-            "`{downloaded_by}`\n\n"
-            "Example:\n"
-            "```\n🎬 {file_name}\n📦 {file_size}\n🔢 #{file_index}\n```\n\n"
-            "/cancel bhejo to rok do.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 BACK", callback_data="cap:back")]
-            ]))
-    elif action == "reset":
-        reset_caption(uid)
-        await q.answer("✅ Reset!")
-        await q.edit_message_text(build_caption_menu(uid),
-                                  reply_markup=caption_keyboard(uid))
-    elif action == "back":
-        await q.answer()
-        try: await q.edit_message_reply_markup(reply_markup=None)
-        except Exception: pass
-
-
-async def cancel_caption_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if WAITING_CAPTION.get(uid):
-        WAITING_CAPTION.pop(uid, None)
-        await update.message.reply_text("❌ Caption update cancel.")
-    else:
-        await update.message.reply_text("ℹ️ Kuch cancel karne ko nahi tha.")
-
-# ═══════════════════════════════════════════════════════════
-#  👑 OWNER COMMANDS
-# ═══════════════════════════════════════════════════════════
-async def add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Sirf owner."); return
-    if not ctx.args or len(ctx.args) < 2:
-        await update.message.reply_text("Usage: `/add <user_id> <days>`",
-                                        parse_mode="Markdown"); return
-    try: target = int(ctx.args[0]); days = int(ctx.args[1])
-    except ValueError:
-        await update.message.reply_text("❌ Numbers hone chahiye."); return
-    if days <= 0:
-        await update.message.reply_text("❌ Days > 0 hone chahiye."); return
-    exp_str = add_premium(target, days, update.effective_user.id)
-    await update.message.reply_text(
-        f"✅ *Premium Added*\n\n"
-        f"👤 `{target}`\n📅 +{days} days\n⏰ {exp_str}",
-        parse_mode="Markdown")
-    try:
-        await ctx.bot.send_message(target,
-            f"🎉 *Premium Activated!*\n\n+{days} days\nExpires: {exp_str}",
-            parse_mode="Markdown")
-    except Exception: pass
-
-
-async def remove_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Sirf owner."); return
-    if not ctx.args:
-        await update.message.reply_text("Usage: /remove <user_id>"); return
-    try: target = int(ctx.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ user_id number."); return
-    if remove_premium(target):
-        await update.message.reply_text(f"✅ `{target}` removed.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"ℹ️ `{target}` premium me nahi tha.",
-                                        parse_mode="Markdown")
-
-
-async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Sirf owner."); return
-    users = list_premium_users()
-    if not users:
-        await update.message.reply_text("📭 Koi premium user nahi."); return
-    now = datetime.utcnow(); lines = ["👥 Premium Users\n"]; a = e = 0
-    for u in users:
-        uid = u["_id"]
-        exp = u.get("expires")
-        if not exp: continue
-        if exp > now:
-            lines.append(f"✅ `{uid}` → {(exp-now).days} din")
-            a += 1
-        else:
-            lines.append(f"❌ `{uid}` → expire"); e += 1
-    lines.append(f"\nTotal: {len(users)} | ✅ {a} | ❌ {e}")
-    await update.message.reply_text("\n".join(lines)[:4000], parse_mode="Markdown")
-
-
-async def myid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🆔 `{update.effective_user.id}`", parse_mode="Markdown")
-
-
-async def premium_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if is_owner(uid):
-        await update.message.reply_text("👑 Owner — unlimited."); return
-    ok_p, days = is_premium(uid)
-    if ok_p:
-        await update.message.reply_text(f"✅ Active — {days} din bache.")
-    else:
-        await update.message.reply_text(
-            f"🚫 Premium nahi.\nAapki ID: `{uid}`", parse_mode="Markdown")
-
-# ───────── GENERAL ─────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    mode = "🚀 4GB (Local API)" if USE_LOCAL_API else "⚠️ 50MB (Public API)"
-    db_status = "✅ Connected" if MONGO_OK else "❌ Offline"
-    if is_owner(uid):
-        access = "👑 Owner"
-    else:
-        ok_p, days = is_premium(uid)
-        access = f"✅ Premium ({days}d)" if ok_p else "🚫 No Premium"
-    url_mode = get_url_mode()
-    await update.message.reply_text(
-        f"👋 *Course Uploader Bot*\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🔧 Mode: {mode}\n"
-        f"📦 Max: {MAX_UPLOAD_MB} MB\n"
-        f"🎫 {access}\n"
-        f"🌐 URL Mode: `{url_mode}`\n"
-        f"🗄️ DB: {db_status}\n\n"
-        f"⚡ *Commands:*\n"
-        f"• /start /help — Info\n"
-        f"• /txt — TXT batch\n"
-        f"• /stop — Rok do\n"
-        f"• /caption — Custom caption\n"
-        f"• /premium — Status\n"
-        f"• /myid — ID",
-        parse_mode="Markdown")
-
-
-async def help_cmd(update, ctx): await start(update, ctx)
-
-
-async def stop_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    STOP_FLAGS[uid] = True
-    task = CURRENT_TASK.get(uid)
-    if task and not task.done():
-        await update.message.reply_text(
-            "🛑 Stop requested! Current item ke baad ruk jayega...")
-    else:
-        await update.message.reply_text("ℹ️ Koi active batch nahi.")
-
-
-async def cancel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer("Cancelling...")
-    try:
-        _, uid_str = q.data.split(":"); uid = int(uid_str)
-    except Exception: return
-    STOP_FLAGS[uid] = True
-    try: await q.edit_message_reply_markup(reply_markup=None)
-    except Exception: pass
-
-
-async def txt_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        ok_p, _ = is_premium(uid)
-        if not ok_p:
-            await update.message.reply_text("🚫 Premium chahiye. /premium dekho.")
-            return
+    # Document from reply or direct
+    doc = None
     if update.message.reply_to_message and update.message.reply_to_message.document:
-        await handle_txt_doc(update, ctx, update.message.reply_to_message.document)
+        doc = update.message.reply_to_message.document
+    elif update.message.document:
+        doc = update.message.document
+
+    if not doc:
+        await update.message.reply_text(
+            "📄 *Cookies Setup*\n\n"
+            "1️⃣ Browser pe Instagram/YouTube login karo\n"
+            "2️⃣ Chrome extension *'Get cookies.txt LOCALLY'* install karo\n"
+            "3️⃣ Export karo → `cookies.txt`\n"
+            "4️⃣ Yahan bhejo:\n"
+            "   `/setcookies` bhejo aur reply me file attach karo\n"
+            "   YA seedha `cookies.txt` file bhejo caption me `/setcookies` likh ke",
+            parse_mode="Markdown")
         return
-    WAITING_TXT[uid] = True
-    await update.message.reply_text("📄 Ab .txt file bhejo.")
+
+    if not (doc.file_name or "").lower().endswith(".txt"):
+        await update.message.reply_text("❌ .txt file bhejo (cookies.txt)"); return
+
+    msg = await update.message.reply_text("📥 Cookies save kar raha...")
+    try:
+        tg_file = await ctx.bot.get_file(doc.file_id)
+        data = await tg_file.download_as_bytearray()
+        content = bytes(data)
+        if len(content) < 50:
+            await msg.edit_text("❌ File bahut chhoti — galat cookies.txt"); return
+        if save_cookies_to_db(content, doc.file_name or "cookies.txt"):
+            COOKIES_FILE.write_bytes(content)
+            await msg.edit_text(
+                f"✅ *Cookies Saved to MongoDB!*\n\n"
+                f"📁 `{doc.file_name}`\n"
+                f"💾 {len(content)} bytes\n\n"
+                f"Ab YouTube, Instagram sab download hoga. Redeploy pe bhi safe.",
+                parse_mode="Markdown")
+        else:
+            await msg.edit_text("❌ MongoDB save fail")
+    except Exception as e:
+        await msg.edit_text(f"❌ Cookies save fail: {str(e)[:200]}")
 
 
+async def getcookies_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 Sirf owner."); return
+    data = load_cookies_from_db()
+    if not data:
+        await update.message.reply_text("📭 Koi cookies nahi."); return
+    content = data.get("content")
+    updated = data.get("updated_at")
+    size = data.get("size", len(content) if content else 0)
+    when = updated.strftime("%d %b %Y, %I:%M %p") if updated else "?"
+    await update.message.reply_text(
+        f"🍪 *Cookies Status*\n\n"
+        f"📁 `{data.get('filename', 'cookies.txt')}`\n"
+        f"💾 {size} bytes\n"
+        f"⏰ Updated: {when}",
+        parse_mode="Markdown")
+
+
+async def delcookies_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 Sirf owner."); return
+    if delete_cookies_from_db():
+        try: COOKIES_FILE.unlink()
+        except: pass
+        await update.message.reply_text("✅ Cookies deleted.")
+    else:
+        await update.message.reply_text("ℹ️ Koi cookies nahi thi.")
+
+
+# Intercept cookies.txt files directly
 async def handle_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    doc = update.message.document
+    fname = (doc.file_name or "").lower()
+    caption = (update.message.caption or "").lower()
+
+    # cookies.txt auto-detect
+    if fname == "cookies.txt" or "cookies" in fname or "/setcookies" in caption:
+        if is_owner(uid):
+            update.message.reply_to_message = None
+            await setcookies_cmd(update, ctx)
+            return
+
     if WAITING_TXT.get(uid):
         WAITING_TXT.pop(uid, None)
-        await handle_txt_doc(update, ctx, update.message.document)
+        await handle_txt_doc(update, ctx, doc)
 
 
 async def handle_txt_doc(update, ctx, doc):
@@ -1307,8 +1037,245 @@ async def handle_txt_doc(update, ctx, doc):
     await msg.edit_text(f"✅ {len(items)} items. Start...")
     await start_batch(update, ctx, items, batch_label=batch_name)
 
+# ═══════════════════════════════════════════════════════════
+#  🔐 URL WHITELIST
+# ═══════════════════════════════════════════════════════════
+async def addurl_cmd(update, ctx):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 Sirf owner."); return
+    if not ctx.args:
+        await update.message.reply_text("Usage: `/addurl <url>`", parse_mode="Markdown"); return
+    url = ctx.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    res = add_url_pattern(url, update.effective_user.id)
+    await update.message.reply_text(res["msg"], parse_mode="Markdown")
 
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+async def delurl_cmd(update, ctx):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 Sirf owner."); return
+    if not ctx.args:
+        await update.message.reply_text("Usage: `/delurl <domain|index>`", parse_mode="Markdown"); return
+    res = remove_url_pattern(ctx.args[0].strip())
+    await update.message.reply_text(res["msg"], parse_mode="Markdown")
+
+
+async def listurl_cmd(update, ctx):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 Sirf owner."); return
+    mode = get_url_mode()
+    domains = list_domains()
+    msg = f"🌐 *URL Whitelist*\n\nMode: `{mode}`\nTotal: {len(domains)}\n\n"
+    for i, d in enumerate(domains, 1): msg += f"{i}. `{d['_id']}`\n"
+    if not domains: msg += "_Koi domain nahi_\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def urlmode_cmd(update, ctx):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 Sirf owner."); return
+    if not ctx.args:
+        await update.message.reply_text(f"Mode: `{get_url_mode()}`", parse_mode="Markdown"); return
+    res = set_url_mode(ctx.args[0])
+    await update.message.reply_text(res["msg"])
+
+# ═══════════════════════════════════════════════════════════
+#  🎨 CAPTION
+# ═══════════════════════════════════════════════════════════
+def build_caption_menu(uid):
+    cap = get_user_caption(uid)
+    status = "Enabled" if cap["enabled"] else "Disabled"
+    return (
+        "Set Caption\n\n➤ Available Variables 📌\n\n"
+        "🎙 Name : {file_name}\n📦 Size : {file_size}\n"
+        "⚙️ Extension : {file_extension}\n⏱ Duration : {file_duration}\n"
+        "🔗 Link : {file_url}\n🔢 Index : {file_index}\n"
+        "📚 Batch Name : {batch_name}\n👤 Downloaded By : {downloaded_by}\n\n"
+        "═══════════════════════\n\n➤ Current:\n"
+        f"{cap['template']}\n\n═══════════════════════\n\n➤ Default:\n"
+        f"{DEFAULT_CAPTION}\n\n➤ Status: {status}"
+    )
+
+
+def caption_keyboard(uid):
+    cap = get_user_caption(uid)
+    t = "🔴 DISABLE" if cap["enabled"] else "🟢 ENABLE"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t, callback_data="cap:toggle")],
+        [InlineKeyboardButton("✏️ UPDATE CAPTION", callback_data="cap:update")],
+        [InlineKeyboardButton("↺ RESET DEFAULT", callback_data="cap:reset")],
+        [InlineKeyboardButton("🔙 BACK", callback_data="cap:back")],
+    ])
+
+
+async def caption_cmd(update, ctx):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        ok_p, _ = is_premium(uid)
+        if not ok_p:
+            await update.message.reply_text(f"🚫 Premium chahiye. ID: `{uid}`",
+                                            parse_mode="Markdown"); return
+    await update.message.reply_text(build_caption_menu(uid),
+                                    reply_markup=caption_keyboard(uid))
+
+
+async def caption_callback(update, ctx):
+    q = update.callback_query; uid = q.from_user.id
+    action = q.data.split(":", 1)[1]
+    if action == "toggle":
+        cap = get_user_caption(uid); set_caption_enabled(uid, not cap["enabled"])
+        await q.answer("✅"); await q.edit_message_text(build_caption_menu(uid),
+                                                        reply_markup=caption_keyboard(uid))
+    elif action == "update":
+        WAITING_CAPTION[uid] = True; await q.answer("Send template")
+        await q.edit_message_text(
+            "✏️ *Caption Update*\n\nVariables: `{file_name}` `{file_size}` "
+            "`{file_extension}` `{file_duration}` `{file_url}` `{file_index}` "
+            "`{batch_name}` `{downloaded_by}`\n\n/cancel se rok do.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 BACK", callback_data="cap:back")]]))
+    elif action == "reset":
+        reset_caption(uid); await q.answer("✅")
+        await q.edit_message_text(build_caption_menu(uid),
+                                  reply_markup=caption_keyboard(uid))
+    elif action == "back":
+        await q.answer()
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except: pass
+
+
+async def cancel_caption_cmd(update, ctx):
+    uid = update.effective_user.id
+    if WAITING_CAPTION.get(uid):
+        WAITING_CAPTION.pop(uid, None)
+        await update.message.reply_text("❌ Cancelled.")
+    else:
+        await update.message.reply_text("ℹ️ Kuch cancel nahi.")
+
+# ═══════════════════════════════════════════════════════════
+#  👑 OWNER
+# ═══════════════════════════════════════════════════════════
+async def add_cmd(update, ctx):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 Sirf owner."); return
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text("Usage: `/add <user_id> <days>`",
+                                        parse_mode="Markdown"); return
+    try: target = int(ctx.args[0]); days = int(ctx.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Numbers hone chahiye."); return
+    if days <= 0: await update.message.reply_text("❌ Days > 0."); return
+    exp_str = add_premium(target, days, update.effective_user.id)
+    await update.message.reply_text(
+        f"✅ *Premium Added*\n\n👤 `{target}`\n📅 +{days} days\n⏰ {exp_str}",
+        parse_mode="Markdown")
+    try:
+        await ctx.bot.send_message(target,
+            f"🎉 *Premium Activated!*\n\n+{days} days\nExpires: {exp_str}",
+            parse_mode="Markdown")
+    except: pass
+
+
+async def remove_cmd(update, ctx):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 Sirf owner."); return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /remove <user_id>"); return
+    try: target = int(ctx.args[0])
+    except: await update.message.reply_text("❌ user_id number."); return
+    if remove_premium(target):
+        await update.message.reply_text(f"✅ `{target}` removed.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"ℹ️ `{target}` nahi tha.", parse_mode="Markdown")
+
+
+async def list_cmd(update, ctx):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 Sirf owner."); return
+    users = list_premium_users()
+    if not users:
+        await update.message.reply_text("📭 Koi user nahi."); return
+    now = datetime.utcnow(); lines = ["👥 Premium Users\n"]; a = e = 0
+    for u in users:
+        exp = u.get("expires")
+        if not exp: continue
+        if exp > now:
+            lines.append(f"✅ `{u['_id']}` → {(exp-now).days} din"); a += 1
+        else:
+            lines.append(f"❌ `{u['_id']}` → expire"); e += 1
+    lines.append(f"\nTotal: {len(users)} | ✅ {a} | ❌ {e}")
+    await update.message.reply_text("\n".join(lines)[:4000], parse_mode="Markdown")
+
+
+async def myid_cmd(update, ctx):
+    await update.message.reply_text(f"🆔 `{update.effective_user.id}`", parse_mode="Markdown")
+
+
+async def premium_cmd(update, ctx):
+    uid = update.effective_user.id
+    if is_owner(uid):
+        await update.message.reply_text("👑 Owner — unlimited."); return
+    ok_p, days = is_premium(uid)
+    if ok_p: await update.message.reply_text(f"✅ Active — {days} din.")
+    else: await update.message.reply_text(f"🚫 Premium nahi.\nID: `{uid}`", parse_mode="Markdown")
+
+# ───────── GENERAL ─────────
+async def start(update, ctx):
+    uid = update.effective_user.id
+    mode = "🚀 4GB" if USE_LOCAL_API else "⚠️ 50MB"
+    db = "✅" if MONGO_OK else "❌"
+    ck = "✅" if (COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0) else "❌"
+    if is_owner(uid): access = "👑 Owner"
+    else:
+        ok_p, days = is_premium(uid)
+        access = f"✅ Premium ({days}d)" if ok_p else "🚫 No Premium"
+    await update.message.reply_text(
+        f"👋 *Course Uploader Bot*\n━━━━━━━━━━━━━━━\n"
+        f"🔧 Mode: {mode}\n📦 Max: {MAX_UPLOAD_MB} MB\n"
+        f"🎫 {access}\n🌐 URL Mode: `{get_url_mode()}`\n"
+        f"🗄️ DB: {db} | 🍪 Cookies: {ck}\n\n"
+        f"⚡ *Commands:*\n"
+        f"• /start /help — Info\n• /txt — TXT batch\n"
+        f"• /stop — Rok do\n• /caption — Custom caption\n"
+        f"• /premium — Status\n• /myid — ID",
+        parse_mode="Markdown")
+
+
+async def help_cmd(update, ctx): await start(update, ctx)
+
+
+async def stop_cmd(update, ctx):
+    uid = update.effective_user.id
+    STOP_FLAGS[uid] = True
+    task = CURRENT_TASK.get(uid)
+    if task and not task.done(): await update.message.reply_text("🛑 Stop requested!")
+    else: await update.message.reply_text("ℹ️ Koi active batch nahi.")
+
+
+async def cancel_cb(update, ctx):
+    q = update.callback_query; await q.answer("Cancelling...")
+    try: _, uid_str = q.data.split(":"); uid = int(uid_str)
+    except: return
+    STOP_FLAGS[uid] = True
+    try: await q.edit_message_reply_markup(reply_markup=None)
+    except: pass
+
+
+async def txt_cmd(update, ctx):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        ok_p, _ = is_premium(uid)
+        if not ok_p:
+            await update.message.reply_text("🚫 Premium chahiye."); return
+    if update.message.reply_to_message and update.message.reply_to_message.document:
+        await handle_txt_doc(update, ctx, update.message.reply_to_message.document)
+        return
+    WAITING_TXT[uid] = True
+    await update.message.reply_text("📄 Ab .txt file bhejo.")
+
+
+async def handle_text(update, ctx):
     uid = update.effective_user.id
     text = (update.message.text or "").strip()
     if not text or text.startswith("/"): return
@@ -1316,13 +1283,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if WAITING_CAPTION.get(uid):
         WAITING_CAPTION.pop(uid, None)
         if len(text) > 900:
-            await update.message.reply_text("❌ Template bahut bada (max 900).")
-            return
+            await update.message.reply_text("❌ Max 900 chars."); return
         set_caption_template(uid, text)
-        await update.message.reply_text("✅ Caption template updated!")
-        await update.message.reply_text(
-            build_caption_menu(uid),
-            reply_markup=caption_keyboard(uid))
+        await update.message.reply_text("✅ Caption updated!")
+        await update.message.reply_text(build_caption_menu(uid),
+                                        reply_markup=caption_keyboard(uid))
         return
 
     if not URL_RE.search(text):
@@ -1336,9 +1301,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ───────── MAIN ─────────
 def main():
-    builder = (Application.builder()
-               .token(BOT_TOKEN)
-               .concurrent_updates(16))
+    builder = Application.builder().token(BOT_TOKEN).concurrent_updates(16)
     if USE_LOCAL_API:
         builder = (builder.base_url(LOCAL_API_BASE)
                           .base_file_url(LOCAL_FILE_BASE)
@@ -1356,11 +1319,14 @@ def main():
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
-    # URL whitelist (owner)
     app.add_handler(CommandHandler("addurl", addurl_cmd))
     app.add_handler(CommandHandler("delurl", delurl_cmd))
     app.add_handler(CommandHandler("listurl", listurl_cmd))
     app.add_handler(CommandHandler("urlmode", urlmode_cmd))
+    # 🍪 Cookies commands
+    app.add_handler(CommandHandler("setcookies", setcookies_cmd))
+    app.add_handler(CommandHandler("getcookies", getcookies_cmd))
+    app.add_handler(CommandHandler("delcookies", delcookies_cmd))
 
     app.add_handler(CallbackQueryHandler(caption_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(cancel_cb, pattern=r"^cancel:"))
@@ -1368,7 +1334,8 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print(f"🤖 Bot chalu... Mode: {'4GB' if USE_LOCAL_API else '50MB'} | MongoDB: {'✅' if MONGO_OK else '❌'}")
+    print(f"🤖 Bot chalu... Mode: {'4GB' if USE_LOCAL_API else '50MB'} | "
+          f"MongoDB: {'✅' if MONGO_OK else '❌'} | Cookies: {'✅' if COOKIES_FILE.exists() else '❌'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
