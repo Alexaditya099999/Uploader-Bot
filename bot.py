@@ -25,7 +25,10 @@ from urllib.parse import urlparse, parse_qs, unquote
 import requests
 import jwt
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes
@@ -34,7 +37,7 @@ from telegram.ext import (
 # ═══════════════════════════════════════════════════════════
 #  🗄️ MONGODB
 # ═══════════════════════════════════════════════════════════
-users_col = captions_col = urls_col = settings_col = cookies_col = None
+users_col = captions_col = settings_col = cookies_col = None
 MONGO_OK = False
 
 try:
@@ -44,7 +47,6 @@ try:
     _db = _client[DB_NAME]
     users_col    = _db["users"]
     captions_col = _db["captions"]
-    urls_col     = _db["urls"]
     settings_col = _db["settings"]
     cookies_col  = _db["cookies"]
     MONGO_OK = True
@@ -102,7 +104,7 @@ DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 THUMB_DIR    = Path("thumbs")
 THUMB_DIR.mkdir(exist_ok=True)
-COOKIES_FILE = Path("cookies.txt")   # 🔥
+COOKIES_FILE = Path("cookies.txt")
 
 WAITING_TXT  = {}
 WAITING_CAPTION = {}
@@ -158,7 +160,6 @@ def delete_cookies_from_db() -> bool:
 
 
 def ensure_cookies_file() -> bool:
-    """MongoDB se cookies.txt local file me likho (yt-dlp ke liye)."""
     data = load_cookies_from_db()
     content = data.get("content")
     if not content:
@@ -171,7 +172,6 @@ def ensure_cookies_file() -> bool:
         return False
 
 
-# Startup pe cookies file bana lo
 if MONGO_OK:
     if ensure_cookies_file():
         print("✅ Cookies loaded from MongoDB")
@@ -259,89 +259,6 @@ def render_caption(template, values):
     for k, v in values.items():
         out = out.replace("{" + k + "}", str(v))
     return out
-
-
-def get_url_mode():
-    if not MONGO_OK: return "open"
-    try:
-        s = settings_col.find_one({"_id": "url_mode"})
-        return s.get("value", "open") if s else "open"
-    except Exception:
-        return "open"
-
-
-def set_url_mode(mode):
-    mode = mode.lower().strip()
-    if mode not in ("open", "locked"):
-        return {"ok": False, "msg": "Mode sirf: open ya locked"}
-    if not MONGO_OK:
-        return {"ok": False, "msg": "❌ DB not available"}
-    try:
-        settings_col.update_one({"_id": "url_mode"}, {"$set": {"value": mode}}, upsert=True)
-        return {"ok": True, "msg": f"✅ Mode set: {mode}"}
-    except Exception as e:
-        return {"ok": False, "msg": f"❌ {e}"}
-
-
-def get_domain(url):
-    try: return (urlparse(url).netloc or "").lower()
-    except Exception: return ""
-
-
-def is_url_allowed(url):
-    mode = get_url_mode()
-    if mode == "open": return True, "open mode"
-    domain = get_domain(url)
-    if not domain: return False, "invalid URL"
-    if not MONGO_OK: return False, "DB offline"
-    try:
-        candidates = [domain]
-        parts = domain.split(".")
-        for i in range(1, len(parts)):
-            candidates.append(".".join(parts[i:]))
-        for c in candidates:
-            if urls_col.find_one({"_id": c}):
-                return True, f"matched: {c}"
-        return False, f"not in whitelist: {domain}"
-    except Exception as e:
-        return False, f"DB error: {e}"
-
-
-def add_url_pattern(url, added_by):
-    domain = get_domain(url)
-    if not domain: return {"ok": False, "msg": "Invalid URL"}
-    if not MONGO_OK: return {"ok": False, "msg": "❌ DB not available"}
-    try:
-        if urls_col.find_one({"_id": domain}):
-            return {"ok": False, "msg": f"⚠️ Already exists: {domain}"}
-        urls_col.insert_one({"_id": domain, "added_by": str(added_by), "added_at": datetime.utcnow()})
-        return {"ok": True, "msg": f"✅ Domain added: `{domain}`"}
-    except Exception as e:
-        return {"ok": False, "msg": f"❌ {e}"}
-
-
-def remove_url_pattern(token):
-    if not MONGO_OK: return {"ok": False, "msg": "❌ DB not available"}
-    try:
-        domains = [d["_id"] for d in urls_col.find({}, {"_id": 1})]
-        if token.isdigit():
-            idx = int(token) - 1
-            if 0 <= idx < len(domains):
-                removed = domains[idx]
-                urls_col.delete_one({"_id": removed})
-                return {"ok": True, "msg": f"✅ Removed: `{removed}`"}
-        d = get_domain(token) or token.lower().strip()
-        if urls_col.delete_one({"_id": d}).deleted_count:
-            return {"ok": True, "msg": f"✅ Removed: `{d}`"}
-        return {"ok": False, "msg": f"❌ Not found: {token}"}
-    except Exception as e:
-        return {"ok": False, "msg": f"❌ {e}"}
-
-
-def list_domains():
-    if not MONGO_OK: return []
-    try: return list(urls_col.find({}).sort("added_at", -1))
-    except Exception: return []
 
 # ═══════════════════════════════════════════════════════════
 #  🎯 URL HANDLING
@@ -550,7 +467,7 @@ def parse_txt(text):
     return items
 
 # ═══════════════════════════════════════════════════════════
-#  📥 DOWNLOAD — yt-dlp (cookies) → HTTP fallback
+#  📥 DOWNLOAD — yt-dlp only (cookies ke saath)
 # ═══════════════════════════════════════════════════════════
 def download_file(url, out_dir, base, info, user_id=None):
     def hook(d):
@@ -568,13 +485,12 @@ def download_file(url, out_dir, base, info, user_id=None):
             if user_id and is_stopped(user_id):
                 raise yt_dlp.utils.DownloadError("User stopped")
 
-    # 🔥 Cookies ensure — MongoDB se file banao
     ensure_cookies_file()
     has_cookies = COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0
     if has_cookies:
         print(f"🍪 Using cookies ({COOKIES_FILE.stat().st_size} bytes)")
     else:
-        print("⚠️ Cookies nahi — YouTube/IG fail honge")
+        print("⚠️ Cookies nahi — YouTube/IG fail ho sakte hain")
 
     browser_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -582,102 +498,53 @@ def download_file(url, out_dir, base, info, user_id=None):
                       "Chrome/120.0.0.0 Safari/537.36",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
         "Referer": f"https://{urlparse(url).netloc}/",
     }
 
-    # ─── STEP 1: yt-dlp ───
-    try:
-        opts = {
-            "outtmpl": str(out_dir / f"{base}.%(ext)s"),
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "quiet": True, "no_warnings": True, "noplaylist": True,
-            "progress_hooks": [hook],
-            "retries": 5, "fragment_retries": 5,
-            "socket_timeout": 30,
-            "http_headers": browser_headers,
-            # 🔥 Cookies
-            "cookiefile": str(COOKIES_FILE) if has_cookies else None,
-            # 🔥 YouTube bypass
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["web", "android", "ios", "tv_embedded"],
-                }
-            },
-            "nocheckcertificate": True,
-            "prefer_insecure": False,
-        }
-        with yt_dlp.YoutubeDL(opts) as y:
-            y.download([url])
+    opts = {
+        "outtmpl": str(out_dir / f"{base}.%(ext)s"),
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "progress_hooks": [hook],
+        "retries": 5, "fragment_retries": 5,
+        "socket_timeout": 30,
+        "http_headers": browser_headers,
+        "cookiefile": str(COOKIES_FILE) if has_cookies else None,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "android", "ios", "tv_embedded"],
+            }
+        },
+        "nocheckcertificate": True,
+    }
+    with yt_dlp.YoutubeDL(opts) as y:
+        y.download([url])
 
-        files = [f for f in out_dir.glob(f"{base}.*") if f.is_file()]
-        if files:
-            f = files[0]
-            if f.stat().st_size >= 10 * 1024:
-                ext = f.suffix.lower()
-                if ext not in MEDIA_EXTS and ext != "":
-                    try:
-                        head = f.read_bytes()[:16]
-                        if head[4:8] == b"ftyp":
-                            new = f.with_suffix(".mp4"); f.rename(new); f = new
-                        elif head[:4] == b"%PDF":
-                            new = f.with_suffix(".pdf"); f.rename(new); f = new
-                    except Exception: pass
-                return f
-            else:
-                try: f.unlink()
-                except: pass
-    except Exception as e:
-        print(f"⚠️ yt-dlp fail: {str(e)[:120]} → HTTP fallback")
+    files = [f for f in out_dir.glob(f"{base}.*") if f.is_file()]
+    if not files:
+        raise FileNotFoundError("Downloaded file missing")
+    f = files[0]
+    size = f.stat().st_size
+    if size < 10 * 1024:
+        try:
+            head = f.read_bytes()[:200].lower()
+            if b"<html" in head or b"<!doctype" in head:
+                f.unlink()
+                raise ValueError("HTML page — ye video nahi hai")
+        except Exception: pass
+        f.unlink()
+        raise ValueError(f"File bahut chhota ({size} bytes)")
 
-    # ─── STEP 2: HTTP direct (HTML, images, generic files) ───
-    print(f"📥 HTTP download: {url[:80]}")
-    with requests.get(url, headers=browser_headers, stream=True,
-                      timeout=120, allow_redirects=True) as r:
-        if r.status_code >= 400:
-            raise ValueError(f"HTTP {r.status_code}")
-        ctype = r.headers.get("Content-Type", "").lower()
-        clen = r.headers.get("Content-Length", "0")
-        try: total = int(clen)
-        except: total = 0
-        info["total"] = total
-
-        url_path = url.split("?")[0].rstrip("/")
-        url_ext = os.path.splitext(url_path)[1].lower()
-        if url_ext and len(url_ext) <= 6 and url_ext not in (".php", ".asp", ".aspx"):
-            ext = url_ext
-        elif "text/html" in ctype: ext = ".html"
-        elif "application/pdf" in ctype: ext = ".pdf"
-        elif "application/json" in ctype: ext = ".json"
-        elif "image/png" in ctype: ext = ".png"
-        elif "image/jpeg" in ctype: ext = ".jpg"
-        elif "text/plain" in ctype: ext = ".txt"
-        elif "application/zip" in ctype: ext = ".zip"
-        else: ext = ".bin"
-
-        out_path = out_dir / f"{base}{ext}"
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 256):
-                if chunk:
-                    f.write(chunk)
-                    info["done"] += len(chunk)
-                    t = time.time()
-                    if info.get("_t"):
-                        dt = t - info["_t"]
-                        if dt >= 0.5:
-                            info["speed"] = (info["done"] - info["_b"]) / dt
-                            info["_t"], info["_b"] = t, info["done"]
-                    else:
-                        info["_t"], info["_b"] = t, info["done"]
-                    if user_id and is_stopped(user_id):
-                        f.close()
-                        try: os.remove(out_path)
-                        except: pass
-                        raise yt_dlp.utils.DownloadError("User stopped")
-
-    if not out_path.exists() or out_path.stat().st_size == 0:
-        raise ValueError("Download failed — empty file")
-    return out_path
+    ext = f.suffix.lower()
+    if ext not in MEDIA_EXTS and ext != "":
+        try:
+            head = f.read_bytes()[:16]
+            if head[4:8] == b"ftyp":
+                new = f.with_suffix(".mp4"); f.rename(new); f = new
+            elif head[:4] == b"%PDF":
+                new = f.with_suffix(".pdf"); f.rename(new); f = new
+        except Exception: pass
+    return f
 
 # ───────── UPLOAD PROGRESS ─────────
 class ProgressFile:
@@ -890,26 +757,13 @@ async def process_items(update, ctx, items, batch_label=""):
 
 async def start_batch(update, ctx, items, batch_label=""):
     user_id = update.effective_user.id
+
     if not is_owner(user_id):
         ok_p, _ = is_premium(user_id)
         if not ok_p:
             await update.message.reply_text(
-                f"🚫 *Access Denied*\n\nAapki ID: `{user_id}`", parse_mode="Markdown")
-            return
-
-    if not is_owner(user_id):
-        blocked = []
-        for it in items:
-            u = it.get("url", "")
-            if u:
-                allowed, reason = is_url_allowed(u)
-                if not allowed: blocked.append((it.get("name", "?"), reason))
-        if blocked:
-            mode = get_url_mode()
-            msg = f"🚫 *URL Not Allowed*\n\nMode: `{mode}`\nBlocked: {len(blocked)}/{len(items)}\n\n"
-            for n, r in blocked[:5]: msg += f"• `{n[:30]}` → {r[:80]}\n"
-            msg += "\nOwner se request karo."
-            await update.message.reply_text(msg, parse_mode="Markdown")
+                f"🚫 *Access Denied*\n\nAapki ID: `{user_id}`",
+                parse_mode="Markdown")
             return
 
     if user_id in CURRENT_TASK and not CURRENT_TASK[user_id].done():
@@ -930,7 +784,6 @@ async def setcookies_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("🚫 Sirf owner."); return
 
-    # Document from reply or direct
     doc = None
     if update.message.reply_to_message and update.message.reply_to_message.document:
         doc = update.message.reply_to_message.document
@@ -940,12 +793,12 @@ async def setcookies_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not doc:
         await update.message.reply_text(
             "📄 *Cookies Setup*\n\n"
-            "1️⃣ Browser pe Instagram/YouTube login karo\n"
+            "1️⃣ Browser pe YouTube/Instagram login karo\n"
             "2️⃣ Chrome extension *'Get cookies.txt LOCALLY'* install karo\n"
             "3️⃣ Export karo → `cookies.txt`\n"
             "4️⃣ Yahan bhejo:\n"
             "   `/setcookies` bhejo aur reply me file attach karo\n"
-            "   YA seedha `cookies.txt` file bhejo caption me `/setcookies` likh ke",
+            "   YA seedha `cookies.txt` file bhejo",
             parse_mode="Markdown")
         return
 
@@ -962,10 +815,10 @@ async def setcookies_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if save_cookies_to_db(content, doc.file_name or "cookies.txt"):
             COOKIES_FILE.write_bytes(content)
             await msg.edit_text(
-                f"✅ *Cookies Saved to MongoDB!*\n\n"
+                f"✅ *Cookies Saved!*\n\n"
                 f"📁 `{doc.file_name}`\n"
                 f"💾 {len(content)} bytes\n\n"
-                f"Ab YouTube, Instagram sab download hoga. Redeploy pe bhi safe.",
+                f"Ab YouTube, Instagram sab download hoga.",
                 parse_mode="Markdown")
         else:
             await msg.edit_text("❌ MongoDB save fail")
@@ -1002,17 +855,14 @@ async def delcookies_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ Koi cookies nahi thi.")
 
 
-# Intercept cookies.txt files directly
 async def handle_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     doc = update.message.document
     fname = (doc.file_name or "").lower()
     caption = (update.message.caption or "").lower()
 
-    # cookies.txt auto-detect
     if fname == "cookies.txt" or "cookies" in fname or "/setcookies" in caption:
         if is_owner(uid):
-            update.message.reply_to_message = None
             await setcookies_cmd(update, ctx)
             return
 
@@ -1036,48 +886,6 @@ async def handle_txt_doc(update, ctx, doc):
     batch_name = (doc.file_name or "TXT")[:60]
     await msg.edit_text(f"✅ {len(items)} items. Start...")
     await start_batch(update, ctx, items, batch_label=batch_name)
-
-# ═══════════════════════════════════════════════════════════
-#  🔐 URL WHITELIST
-# ═══════════════════════════════════════════════════════════
-async def addurl_cmd(update, ctx):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Sirf owner."); return
-    if not ctx.args:
-        await update.message.reply_text("Usage: `/addurl <url>`", parse_mode="Markdown"); return
-    url = ctx.args[0].strip()
-    if not url.startswith("http"): url = "https://" + url
-    res = add_url_pattern(url, update.effective_user.id)
-    await update.message.reply_text(res["msg"], parse_mode="Markdown")
-
-
-async def delurl_cmd(update, ctx):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Sirf owner."); return
-    if not ctx.args:
-        await update.message.reply_text("Usage: `/delurl <domain|index>`", parse_mode="Markdown"); return
-    res = remove_url_pattern(ctx.args[0].strip())
-    await update.message.reply_text(res["msg"], parse_mode="Markdown")
-
-
-async def listurl_cmd(update, ctx):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Sirf owner."); return
-    mode = get_url_mode()
-    domains = list_domains()
-    msg = f"🌐 *URL Whitelist*\n\nMode: `{mode}`\nTotal: {len(domains)}\n\n"
-    for i, d in enumerate(domains, 1): msg += f"{i}. `{d['_id']}`\n"
-    if not domains: msg += "_Koi domain nahi_\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-async def urlmode_cmd(update, ctx):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 Sirf owner."); return
-    if not ctx.args:
-        await update.message.reply_text(f"Mode: `{get_url_mode()}`", parse_mode="Markdown"); return
-    res = set_url_mode(ctx.args[0])
-    await update.message.reply_text(res["msg"])
 
 # ═══════════════════════════════════════════════════════════
 #  🎨 CAPTION
@@ -1233,7 +1041,7 @@ async def start(update, ctx):
     await update.message.reply_text(
         f"👋 *Course Uploader Bot*\n━━━━━━━━━━━━━━━\n"
         f"🔧 Mode: {mode}\n📦 Max: {MAX_UPLOAD_MB} MB\n"
-        f"🎫 {access}\n🌐 URL Mode: `{get_url_mode()}`\n"
+        f"🎫 {access}\n"
         f"🗄️ DB: {db} | 🍪 Cookies: {ck}\n\n"
         f"⚡ *Commands:*\n"
         f"• /start /help — Info\n• /txt — TXT batch\n"
@@ -1299,9 +1107,52 @@ async def handle_text(update, ctx):
     await update.message.reply_text(f"✅ {len(items)} item(s). Shuru...")
     await start_batch(update, ctx, items, batch_label="Direct URL")
 
+# ═══════════════════════════════════════════════════════════
+#  🎯 POST INIT — MENU SETUP
+# ═══════════════════════════════════════════════════════════
+async def post_init(app):
+    """Bot start hote hi command menu set karo."""
+    general_commands = [
+        BotCommand("start", "Bot info"),
+        BotCommand("help", "Help"),
+        BotCommand("txt", "TXT batch upload"),
+        BotCommand("stop", "Stop current batch"),
+        BotCommand("caption", "Custom caption setup"),
+        BotCommand("premium", "Check premium status"),
+        BotCommand("myid", "Get your Telegram ID"),
+    ]
+
+    owner_commands = general_commands + [
+        BotCommand("add", "Add premium (owner)"),
+        BotCommand("remove", "Remove premium (owner)"),
+        BotCommand("list", "List premium users (owner)"),
+        BotCommand("setcookies", "Upload cookies (owner)"),
+        BotCommand("getcookies", "Cookies status (owner)"),
+        BotCommand("delcookies", "Delete cookies (owner)"),
+    ]
+
+    # Default menu — sab users ke liye
+    try:
+        await app.bot.set_my_commands(
+            general_commands, scope=BotCommandScopeDefault())
+        print("✅ Default menu set")
+    except Exception as e:
+        print(f"⚠️ Default menu fail: {e}")
+
+    # Owner-only menu
+    try:
+        await app.bot.set_my_commands(
+            owner_commands, scope=BotCommandScopeChat(chat_id=int(OWNER_ID)))
+        print("✅ Owner menu set")
+    except Exception as e:
+        print(f"⚠️ Owner menu fail: {e}")
+
 # ───────── MAIN ─────────
 def main():
-    builder = Application.builder().token(BOT_TOKEN).concurrent_updates(16)
+    builder = (Application.builder()
+               .token(BOT_TOKEN)
+               .concurrent_updates(16)
+               .post_init(post_init))   # 🔥 MENU AUTO-SETUP
     if USE_LOCAL_API:
         builder = (builder.base_url(LOCAL_API_BASE)
                           .base_file_url(LOCAL_FILE_BASE)
@@ -1319,10 +1170,6 @@ def main():
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
-    app.add_handler(CommandHandler("addurl", addurl_cmd))
-    app.add_handler(CommandHandler("delurl", delurl_cmd))
-    app.add_handler(CommandHandler("listurl", listurl_cmd))
-    app.add_handler(CommandHandler("urlmode", urlmode_cmd))
     # 🍪 Cookies commands
     app.add_handler(CommandHandler("setcookies", setcookies_cmd))
     app.add_handler(CommandHandler("getcookies", getcookies_cmd))
